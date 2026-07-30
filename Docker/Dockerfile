@@ -14,7 +14,7 @@ COPY requirements.txt .
 
 RUN pip install --no-cache-dir -r requirements.txt
 
-RUN git clone --recurse-submodules https://github.com/bnnt29/solix_web_dashboard.git
+RUN git clone --recurse-submodules https://github.com/bnnt29/solix_web_dashboard.git solix_web_dashboard
 
 COPY . .
 
