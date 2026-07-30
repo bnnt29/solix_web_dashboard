@@ -22,7 +22,7 @@ services:
     command:
       [
         "python",
-        "solix_web_dashboard/src/api/pv_monitor.py",
+        "/app/solix_web_dashboard/src/api/pv_monitor.py",
         "--live-cloud",
         "--energy-stats",
         "--interval",
