@@ -11,15 +11,15 @@ from pathlib import Path
 import select
 import sys
 
-from anker_solix_api.apitypes import (
+from solix_api.src.anker_solix_api.apitypes import (
     Color,
     SolarbankRatePlan,
     SolarbankSchedulePresetType,
     SolarbankUsageMode,
 )
-from anker_solix_api.helpers import get_enum_name, round_by_factor
-from anker_solix_api.mqtt_device import SolixMqttDevice
-from anker_solix_api.mqttcmdmap import (
+from solix_api.src.anker_solix_api.helpers import get_enum_name, round_by_factor
+from solix_api.src.anker_solix_api.mqtt_device import SolixMqttDevice
+from solix_api.src.anker_solix_api.mqttcmdmap import (
     LENGTH,
     STATE_CONVERTER,
     STATE_NAME,
@@ -31,7 +31,7 @@ from anker_solix_api.mqttcmdmap import (
     VALUE_STATE,
     VALUE_STEP,
 )
-from anker_solix_api.mqtttypes import convert_weekdays
+from solix_api.src.anker_solix_api.mqtttypes import convert_weekdays
 
 # platform dependent imports for key press handling
 if sys.platform.startswith("win"):

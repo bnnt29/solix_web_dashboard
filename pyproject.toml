@@ -1,0 +1,28 @@
+[project]
+name = "anker-solix-web_dashboard"
+version = "1.0.0"
+authors = [
+  { name="Bennet Richter", email="bennet.richter@tu-dortmund.de" },
+]
+description = "Python library for Anker Solix Power devices (Solarbank, Inverter, PPS etc.)"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.12"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+]
+dynamic = [ "dependencies" ]
+
+[project.urls]
+"Homepage" = "https://github.com/thomluther/anker-solix-web_dashboard"
+"Bug Tracker" = "https://github.com/thomluther/anker-solix-web_dashboard/issues"
+"Discussions" = "https://github.com/thomluther/anker-solix-web_dashboard/discussions"
+
+
+[tool.poetry.dependencies]
+aiohttp = ">=3.10.11"
+aiofiles = ">=25.1.0"
+cryptography = ">=3.4.8"
+paho-mqtt = ">=2.1.0"
+python-dotenv = ">=1.2.1"

@@ -1,0 +1,4 @@
+
+[submodule "src/solix_api"]
+	path = src/solix_api
+	url = git@github.com:thomluther/anker-solix-api.git

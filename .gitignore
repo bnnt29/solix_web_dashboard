@@ -218,3 +218,7 @@ __marimo__/
 .streamlit/secrets.toml
 
 solix-monitor.config.json
+
+src/dashboard/exports
+src/dashboard/exports/
+src/dashboard/exports/*

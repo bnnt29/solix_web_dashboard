@@ -10,7 +10,7 @@ for long-term time-series storage or later imports into databases.
 Note: When the system owning account is used, more details for the systems and devices can be queried and displayed.
 
 
-python pv_monitor.py --live-cloud --energy-stats --interval 10 --sample-interval 5 --storage-root ./solix-dashboard/exports/timeseries --web-folder ./solix-dashboard --web-host 0.0.0.0 --web-port 8080
+python pv_monitor.py --live-cloud --energy-stats --interval 10 --sample-interval 5 --storage-root ../dashboard/exports/timeseries --web-folder ../sdashboard --web-host 0.0.0.0 --web-port 8080
 """
 
 import argparse
@@ -22,8 +22,8 @@ from pathlib import Path
 
 from aiohttp import ClientSession, web
 from aiohttp.client_exceptions import ClientError
-from anker_solix_api.api import AnkerSolixApi
-from anker_solix_api.apitypes import (
+from solix_api.src.anker_solix_api.api import AnkerSolixApi
+from solix_api.src.anker_solix_api.apitypes import (
     Color,
     SolarbankAiemsStatus,
     SolarbankLightMode,
@@ -67,8 +67,8 @@ from anker_solix_api.apitypes import (
     SolixVehicle,
     SolixWorkingStatus,
 )
-from anker_solix_api.errors import AnkerSolixError, RequestLimitError
-from anker_solix_api.helpers import get_enum_name, get_solix_product_code
+from solix_api.src.anker_solix_api.errors import AnkerSolixError, RequestLimitError
+from solix_api.src.anker_solix_api.helpers import get_enum_name, get_solix_product_code
 import common
 
 # use Console logger from common module
@@ -3811,7 +3811,7 @@ class AnkerSolixApiMonitor:
             async with ClientSession() as websession:
                 user = "" if self.use_file else common.user()
                 if not self.use_file:
-                    CONSOLE.info("Trying Api authentication for user %s...", user)
+                    CONSOLE.info("Trying Api authentication for user %s...%s", user, "")
 
                 # Create a logger for the API with appropriate level
                 if self.debug_http:
@@ -3829,8 +3829,8 @@ class AnkerSolixApiMonitor:
 
                 self.api = AnkerSolixApi(
                     user,
-                    "" if self.use_file else common.password(),
-                    "" if self.use_file else common.country(),
+                    common.password(),
+                    common.country(),
                     websession,
                     api_logger,
                 )
