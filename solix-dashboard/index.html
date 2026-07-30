@@ -1,0 +1,329 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title data-i18n="documentTitle">Solar Monitor</title>
+
+  <link rel="stylesheet" href="styles.css" />
+
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+</head>
+
+<body>
+  <div class="background-grid"></div>
+  <div class="orb orb-one"></div>
+  <div class="orb orb-two"></div>
+
+  <main class="dashboard">
+    <header class="topbar">
+        <section class="top-actions">
+            <div class="language-switcher" aria-label="Language selection">
+            <button
+                class="language-button"
+                type="button"
+                data-language-switch="en"
+                aria-label="Switch language to English">EN
+            </button>
+
+            <button
+                class="language-button"
+                type="button"
+                data-language-switch="de"
+                aria-label="Sprache auf Deutsch umstellen">DE
+            </button>
+            </div>
+
+            <label id="manualLoadLabel" class="file-button hidden">
+            <span data-i18n="loadData">Load data</span>
+            <input id="fileInput" type="file" accept=".jsonl,.ndjson,.txt,application/json" />
+            </label>
+        </section>
+        </header>
+
+    <!-- <section id="dropZone" class="drop-zone">
+      <span>
+        <span data-i18n="dropFilePrefix">Drop</span>
+        <strong>pv_monitor_timeseries.jsonl</strong>
+        <span data-i18n="dropFileSuffix">here</span>
+      </span>
+      <small data-i18n="dropFileHint">or use “Load data” above</small>
+    </section> -->
+
+    <section class="status-strip">
+      <div>
+        <span class="status-dot"></span>
+        <span id="statusText" data-i18n="waitingForData">Waiting for data</span>
+        <p id="subtitle" data-i18n="appSubtitle">Load your JSONL time-series file to start monitoring.</p>
+      </div>
+
+      <div id="timeRange">—</div>
+    </section>
+
+    <section class="kpi-grid">
+        <article class="kpi-card solar">
+            <span class="kpi-icon">☀</span>
+            <span class="kpi-label" data-i18n="pvPower">PV Power</span>
+            <strong id="pvPower">—</strong>
+            <small id="pvSub" data-i18n="pvSub">Solar generation now</small>
+        </article>
+
+        <article class="kpi-card battery">
+            <span class="kpi-icon">▰</span>
+            <span class="kpi-label" data-i18n="battery">Battery</span>
+            <strong id="batterySoc">—</strong>
+            <small id="batteryPower">—</small>
+        </article>
+
+        <article class="kpi-card output">
+            <span class="kpi-icon">⇥</span>
+            <span class="kpi-label" data-i18n="systemOutput">System Output</span>
+            <strong id="systemOutputPower">—</strong>
+            <small id="systemOutputSub" data-i18n="systemOutputSub">Solar / battery to house or grid</small>
+        </article>
+
+        <article class="kpi-card home">
+            <span class="kpi-icon">⌂</span>
+            <span class="kpi-label" data-i18n="homeLoad">Home Load</span>
+            <strong id="homeLoad">—</strong>
+            <small id="homeSub" data-i18n="homeSub">Current consumption</small>
+        </article>
+
+        <article class="kpi-card grid">
+            <span class="kpi-icon">↯</span>
+            <span class="kpi-label" data-i18n="grid">Grid</span>
+            <strong id="gridPower">—</strong>
+            <small id="gridSub" data-i18n="gridSub">Import / export</small>
+        </article>
+    </section>
+
+    <section class="main-grid">
+      <article class="panel flow-panel">
+        <div class="panel-header">
+          <div>
+            <span class="eyebrow" data-i18n="live">Live</span>
+            <h2 data-i18n="energyFlow">Energy Flow</h2>
+          </div>
+          <span id="lastUpdate" class="pill" data-i18n="noUpdate">No update</span>
+        </div>
+
+        <div class="flow">
+          <svg class="flow-svg" id="flowSvg" aria-hidden="true">
+            <defs>
+              <linearGradient id="flowGradient" x1="0%" y1="0%" x2="100%" y2="0%">
+                <stop offset="0%" stop-color="#5ee7ff" stop-opacity="0.1" />
+                <stop offset="45%" stop-color="#5ee7ff" stop-opacity="1" />
+                <stop offset="100%" stop-color="#4dffb4" stop-opacity="1" />
+              </linearGradient>
+
+              <filter id="flowGlow" x="-50%" y="-50%" width="200%" height="200%">
+                <feGaussianBlur stdDeviation="4" result="blur" />
+                <feMerge>
+                  <feMergeNode in="blur" />
+                  <feMergeNode in="SourceGraphic" />
+                </feMerge>
+              </filter>
+            </defs>
+
+            <path id="pathPvHome" class="flow-path flow-path-main flow-path-solar" />
+            <path id="pathPvBattery" class="flow-path flow-path-solar" />
+            <path id="pathBatteryHome" class="flow-path flow-path-battery" />
+            <path id="pathGridHome" class="flow-path flow-path-grid" />
+
+            <g id="labelPvHome" class="flow-label">
+              <rect />
+              <text></text>
+            </g>
+
+            <g id="labelPvBattery" class="flow-label">
+              <rect />
+              <text></text>
+            </g>
+
+            <g id="labelBatteryHome" class="flow-label">
+              <rect />
+              <text></text>
+            </g>
+
+            <g id="labelGridHome" class="flow-label">
+              <rect />
+              <text></text>
+            </g>
+          </svg>
+
+          <div class="node node-pv">
+            <span>☀</span>
+            <strong>PV</strong>
+            <small id="flowPv">—</small>
+          </div>
+
+          <div class="node node-home">
+            <span>⌂</span>
+            <strong data-i18n="home">Home</strong>
+            <small id="flowHome">—</small>
+          </div>
+
+          <div class="node node-battery">
+            <span>▰</span>
+            <strong data-i18n="battery">Battery</strong>
+            <small id="flowBattery">—</small>
+          </div>
+
+          <div class="node node-grid">
+            <span>↯</span>
+            <strong data-i18n="grid">Grid</strong>
+            <small id="flowGrid">—</small>
+          </div>
+        </div>
+      </article>
+
+      <article class="panel summary-panel">
+        <div class="panel-header">
+          <div>
+            <span class="eyebrow" data-i18n="today">Today</span>
+            <h2 data-i18n="energySummary">Energy Summary</h2>
+          </div>
+        </div>
+
+        <div class="summary-list">
+          <div>
+            <span data-i18n="solarProduction">Solar production</span>
+            <strong id="energySolarToday">—</strong>
+          </div>
+          <div>
+            <span data-i18n="homeUsage">Home usage</span>
+            <strong id="energyHomeToday">—</strong>
+          </div>
+          <div>
+            <span data-i18n="batteryCharged">Battery charged</span>
+            <strong id="energyChargeToday">—</strong>
+          </div>
+          <div>
+            <span data-i18n="batteryDischarged">Battery discharged</span>
+            <strong id="energyDischargeToday">—</strong>
+          </div>
+          <div>
+            <span data-i18n="gridToHome">Grid to home</span>
+            <strong id="energyGridToday">—</strong>
+          </div>
+          <div>
+            <span data-i18n="solarExport">Solar export</span>
+            <strong id="energyExportToday">—</strong>
+          </div>
+        </div>
+      </article>
+    </section>
+
+    <section class="kpi-grid stats-kpi-grid">
+        <article class="kpi-card stat-generated">
+            <span class="kpi-icon">Σ</span>
+            <span class="kpi-label" data-i18n="totalGenerated">Generated</span>
+            <strong id="totalGenerated">—</strong>
+            <small data-i18n="totalGeneratedSub">Total produced energy</small>
+        </article>
+
+        <article class="kpi-card stat-co2">
+            <span class="kpi-icon">♻</span>
+            <span class="kpi-label" data-i18n="co2Saved">CO₂ saved</span>
+            <strong id="co2Saved">—</strong>
+            <small data-i18n="co2SavedSub">Avoided emissions</small>
+        </article>
+
+        <article class="kpi-card stat-savings">
+            <span class="kpi-icon">€</span>
+            <span class="kpi-label" data-i18n="moneySaved">Saved</span>
+            <strong id="moneySaved">—</strong>
+            <small data-i18n="moneySavedSub">Estimated savings</small>
+        </article>
+    </section>
+
+    <section class="panel chart-panel">
+      <div class="panel-header chart-heading">
+        <div>
+          <span class="eyebrow" data-i18n="timeline">Timeline</span>
+          <h2 data-i18n="performance">Performance</h2>
+        </div>
+
+        <div class="chart-toolbar">
+          <label class="detail-toggle">
+            <input id="detailToggle" type="checkbox" checked />
+            <span data-i18n="detailed">Detailed</span>
+          </label>
+
+          <label class="detail-toggle">
+            <input id="fullRangeToggle" type="checkbox" checked />
+            <span data-i18n="showFullDuration">Show full duration</span>
+          </label>
+        </div>
+      </div>
+
+      <div class="chart-control-block">
+        <div class="control-title" data-i18n="timeRange">Time range</div>
+
+        <div class="chart-tabs time-tabs">
+          <button class="active" data-range="today" type="button" data-i18n="today">Today</button>
+          <button data-range="last24h" type="button" data-i18n="last24h">Last 24h</button>
+          <button data-range="currentWeek" type="button" data-i18n="currentWeek">This week</button>
+          <button data-range="last7d" type="button" data-i18n="last7d">7 days</button>
+          <button data-range="currentMonth" type="button" data-i18n="currentMonth">This month</button>
+          <button data-range="last30d" type="button" data-i18n="last30d">30 days</button>
+          <button data-range="currentYear" type="button" data-i18n="currentYear">This year</button>
+          <button data-range="last365d" type="button" data-i18n="last365d">365 days</button>
+          <button data-range="all" type="button" data-i18n="all">All</button>
+        </div>
+      </div>
+
+      <div class="chart-control-block">
+        <div class="control-title" data-i18n="view">View</div>
+
+        <div class="chart-tabs source-tabs">
+          <button class="active" data-chart-group="overview" type="button" data-i18n="overview">Overview</button>
+          <button data-chart-group="solar" type="button" data-i18n="solar">Solar</button>
+          <button data-chart-group="battery" type="button" data-i18n="battery">Battery</button>
+          <button data-chart-group="house" type="button" data-i18n="house">House</button>
+          <button data-chart-group="grid" type="button" data-i18n="grid">Grid</button>
+          <button data-chart-group="energy" type="button" data-i18n="energy">Energy</button>
+        </div>
+      </div>
+
+      <div class="chart-wrap">
+        <canvas id="mainChart"></canvas>
+      </div>
+
+      <div id="chartInsights" class="chart-insights">
+        <div class="insight-card muted" data-i18n="loadDataForInsights">Load data to see performance insights.</div>
+      </div>
+    </section>
+
+    <details class="panel advanced-panel">
+      <summary>
+        <span data-i18n="advancedMetrics">Advanced metrics</span>
+        <span data-i18n="advancedMetricsSubtitle">Optional raw metric selector</span>
+      </summary>
+
+      <div class="advanced-content">
+        <input
+          id="metricSearch"
+          type="search"
+          placeholder="Search metrics..."
+          data-i18n-placeholder="searchMetrics"
+        />
+        <div id="metricList" class="metric-list"></div>
+      </div>
+    </details>
+  </main>
+  <script>
+  window.DASHBOARD_CONFIG = {
+    monthlyJsonlRoot: "./exports/timeseries",
+
+    // Optional, recommended if you do not have a manifest:
+    startMonth: "2026-01",
+
+    // Alternative:
+    startYear: 2026
+  };
+</script>
+  <script src="i18n.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,4281 @@
+#!/usr/bin/env python
+"""Example exec module to use the Anker API for continuously querying and displaying important parameters of Anker Solix sites and devices.
+
+This module will prompt for the Anker account details if not pre-set in the header. Upon successful authentication,
+you will see system and device parameters and values displayed and refreshed at regular interval.
+
+The monitor can persist the latest API cache as newline-delimited JSON (JSONL), which is append-only and suitable
+for long-term time-series storage or later imports into databases.
+
+Note: When the system owning account is used, more details for the systems and devices can be queried and displayed.
+
+
+python pv_monitor.py --live-cloud --energy-stats --interval 10 --sample-interval 5 --storage-root ./solix-dashboard/exports/timeseries --web-folder ./solix-dashboard --web-host 0.0.0.0 --web-port 8080
+"""
+
+import argparse
+import asyncio
+from datetime import datetime, timedelta
+import json
+import logging
+from pathlib import Path
+
+from aiohttp import ClientSession, web
+from aiohttp.client_exceptions import ClientError
+from anker_solix_api.api import AnkerSolixApi
+from anker_solix_api.apitypes import (
+    Color,
+    SolarbankAiemsStatus,
+    SolarbankLightMode,
+    SolarbankUsageMode,
+    SolixBatteryStatus,
+    SolixBatteryType,
+    SolixBatteryVoltageType,
+    SolixChargerMode,
+    SolixChargerPortStatus,
+    SolixChargerUsageMode,
+    SolixClockMode,
+    SolixConnectionStatus,
+    SolixCpSignalStatus,
+    SolixDeviceType,
+    SolixDisplayTimeoutMode,
+    SolixEvChargerSolarMode,
+    SolixEvChargerStatus,
+    SolixEvChargerWipeMode,
+    SolixKnobMode,
+    SolixMode,
+    SolixOcppConnectionStatus,
+    SolixPhaseMode,
+    SolixPlantStatus,
+    SolixPlugTimerMode,
+    SolixPpsChargingStatus,
+    SolixPpsDcChargingStatus,
+    SolixPpsDisplayMode,
+    SolixPpsLoadMode,
+    SolixPpsOutputMode,
+    SolixPpsOutputModeV2,
+    SolixPpsPortStatus,
+    SolixPpsUsageMode,
+    SolixPriceProvider,
+    SolixPriceTypes,
+    SolixScheduleWeekendMode,
+    SolixSiteType,
+    SolixSmartTouchMode,
+    SolixSwitchMode,
+    SolixSwitchModeV2,
+    SolixTariffTypes,
+    SolixVehicle,
+    SolixWorkingStatus,
+)
+from anker_solix_api.errors import AnkerSolixError, RequestLimitError
+from anker_solix_api.helpers import get_enum_name, get_solix_product_code
+import common
+
+# use Console logger from common module
+CONSOLE: logging.Logger = common.CONSOLE
+# enable debug mode for the console handler
+# CONSOLE.handlers[0].setLevel(logging.DEBUG)
+
+# Interactive allows to select examples and exports as input for tests and debug
+INTERACTIVE = True
+# Enable to show Api calls and cache details for additional debugging
+SHOWAPICALLS = False
+
+DEFAULT_CONFIG: dict = {
+    "credentials": {
+        "user": "",
+        "password": "",
+        "country": "DE",
+    },
+
+    "console": {
+        "enabled": True,
+        "detail": "compact",
+        "log_level": "INFO",
+        "show_api_calls": False,
+    },
+}
+
+
+def deep_merge_dict(base: dict, override: dict) -> dict:
+    """Return recursive merge of override into base without modifying base."""
+    result = dict(base)
+
+    for key, value in override.items():
+        if (
+            isinstance(value, dict)
+            and isinstance(result.get(key), dict)
+        ):
+            result[key] = deep_merge_dict(result[key], value)
+        else:
+            result[key] = value
+
+    return result
+
+
+def load_monitor_config(path: Path) -> dict:
+    """Load monitor config from JSON file, creating a default file if missing."""
+    path = path.expanduser()
+
+    if not path.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        path.write_text(
+            json.dumps(DEFAULT_CONFIG, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+
+        CONSOLE.info("Created default config file: %s", path)
+        return DEFAULT_CONFIG
+
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+
+        if not isinstance(loaded, dict):
+            raise ValueError("Config root must be a JSON object.")
+
+        return deep_merge_dict(DEFAULT_CONFIG, loaded)
+
+    except Exception as err:  # noqa: BLE001
+        CONSOLE.warning(
+            "Could not load config file %s: %s. Using defaults.",
+            path,
+            err,
+        )
+        return DEFAULT_CONFIG
+    
+def apply_credentials_from_config(config: dict) -> None:
+    """Apply Anker credentials from monitor config to common.py."""
+    credentials = config.get("credentials") or {}
+
+    user_value = (
+        credentials.get("user")
+        or credentials.get("USER")
+        or None
+    )
+
+    password_value = (
+        credentials.get("password")
+        or credentials.get("PASSWORD")
+        or None
+    )
+
+    country_value = (
+        credentials.get("country")
+        or credentials.get("COUNTRY")
+        or None
+    )
+
+    if hasattr(common, "set_credentials"):
+        common.set_credentials(
+            user_value=user_value,
+            password_value=password_value,
+            country_value=country_value,
+        )
+    else:
+        # Fallback for older common.py versions.
+        if hasattr(common, "_CREDENTIALS"):
+            if user_value is not None:
+                common._CREDENTIALS["USER"] = user_value
+
+            if password_value is not None:
+                common._CREDENTIALS["PASSWORD"] = password_value
+
+            if country_value is not None:
+                common._CREDENTIALS["COUNTRY"] = country_value
+
+
+def get_log_level(level_name: str) -> int:
+    """Convert logging level name to numeric logging level."""
+    return getattr(logging, str(level_name).upper(), logging.INFO)
+
+def parse_arguments() -> argparse.Namespace:
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Anker Solix Monitor - Monitor your Anker Solix devices in real-time"
+    )
+    parser.add_argument(
+        "--live-cloud",
+        "-live",
+        action="store_true",
+        help="Use live cloud data (default: interactive mode asks for input source)",
+    )
+    parser.add_argument(
+        "--interval",
+        "-i",
+        type=int,
+        default=30,
+        choices=range(5, 601),
+        metavar="[5-600]",
+        help="Refresh interval in seconds (default: 30)",
+    )
+    parser.add_argument(
+        "--energy-stats",
+        "-energy",
+        action="store_true",
+        help="Include daily site energy statistics on API display",
+    )
+    parser.add_argument("--site-id", type=str, help="Monitor specific site ID only")
+    parser.add_argument(
+        "--device-id",
+        "-dev",
+        type=str,
+        help="Filter output for specific device ID only",
+    )
+    parser.add_argument(
+        "--no-vehicles",
+        "-no-ev",
+        action="store_true",
+        help="Disable electric vehicles on API display",
+    )
+    parser.add_argument(
+        "--api-calls", action="store_true", help="Show API call statistics and details"
+    )
+    parser.add_argument(
+        "--debug-http",
+        action="store_true",
+        help="Show HTTP request/response debug messages (very verbose)",
+    )
+    parser.add_argument(
+        "--endpoint-limit",
+        type=int,
+        default=10,
+        choices=range(51),
+        metavar="[0-50]",
+        help="Set API endpoint limit for request throttling (0=disabled, default: 10)",
+    )
+    parser.add_argument(
+        "--storage-root",
+        type=Path,
+        default=Path("solix-dashboard") / "exports" / "timeseries",
+        help=(
+            "Root folder for monthly JSONL time-series files. "
+            "Files are written as <storage-root>/<year>/<year>-<month>.jsonl "
+            "(default: solix-dashboard/exports/timeseries)"
+        ),
+    )
+    parser.add_argument(
+        "--web-folder",
+        type=Path,
+        default=None,
+        help=(
+            "Folder to serve via the built-in webserver. "
+            "If omitted, no webserver is started. "
+            "Example: --web-folder solix-dashboard/exports"
+        ),
+    )
+    parser.add_argument(
+        "--web-host",
+        type=str,
+        default="127.0.0.1",
+        help="Webserver host/interface (default: 127.0.0.1)",
+    )
+    parser.add_argument(
+        "--web-port",
+        type=int,
+        default=8080,
+        choices=range(1, 65536),
+        metavar="[1-65535]",
+        help="Webserver port (default: 8080)",
+    )
+    parser.add_argument(
+        "--sample-interval",
+        type=int,
+        default=10,
+        choices=range(5, 3601),
+        metavar="[5-3600]",
+        help="Storage sample interval in seconds (default: 10)",
+    )
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=Path("solix-monitor.config.json"),
+        help="Path to monitor config file (default: solix-monitor.config.json)",
+    )
+
+    parser.add_argument(
+        "--console-detail",
+        choices=["silent", "minimal", "compact", "full"],
+        default=None,
+        help=(
+            "Override console detail from config. "
+            "Options: silent, minimal, compact, full"
+        ),
+    )
+
+    parser.add_argument(
+        "--console-log-level",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+        default=None,
+        help="Override console log level from config.",
+    )
+    
+    parser.add_argument(
+        "--api-retry-interval",
+        type=int,
+        default=120,
+        choices=range(30, 3601),
+        metavar="[30-3600]",
+        help="Retry delay in seconds after temporary API failures or rate limits (default: 120)",
+    )
+
+    parser.add_argument(
+        "--energy-rate-limit-backoff",
+        type=int,
+        default=300,
+        choices=range(60, 7201),
+        metavar="[60-7200]",
+        help="Backoff in seconds for energy statistics after energy_analysis rate limits (default: 300)",
+    )
+
+    args = parser.parse_args()
+    return args
+
+
+class AnkerSolixApiMonitor:
+    """Define the class for the monitor."""
+
+    def __init__(self, args: argparse.Namespace | None = None) -> None:
+        """Initialize."""
+        # Parse command line arguments if not provided
+        if not isinstance(args, argparse.Namespace):
+            args = parse_arguments()
+        self.config: dict = load_monitor_config(args.config)
+        apply_credentials_from_config(self.config)
+        console_config = self.config.get("console") or {}
+        # Set configuration based on command line arguments
+        self.interactive: bool = INTERACTIVE and not args.live_cloud
+        self.showApiCalls: bool = (
+            args.api_calls
+            or bool(console_config.get("show_api_calls", False))
+            or SHOWAPICALLS
+        )
+        self.showApiCalls: bool = (
+            args.api_calls
+            or bool(console_config.get("show_api_calls", False))
+            or SHOWAPICALLS
+        )
+        self.console_enabled: bool = bool(console_config.get("enabled", True))
+
+        self.console_detail: str = (
+            args.console_detail
+            or str(console_config.get("detail", "compact"))
+        ).lower()
+
+        if self.console_detail not in {"silent", "minimal", "compact", "full"}:
+            CONSOLE.warning(
+                "Invalid console detail '%s', falling back to 'compact'.",
+                self.console_detail,
+            )
+            self.console_detail = "compact"
+
+        self.console_log_level_name: str = (
+            args.console_log_level
+            or str(console_config.get("log_level", "INFO"))
+        ).upper()
+
+        self.console_log_level: int = get_log_level(self.console_log_level_name)
+
+        CONSOLE.setLevel(self.console_log_level)
+        for handler in CONSOLE.handlers:
+            handler.setLevel(self.console_log_level)
+        self.showVehicles: bool = not args.no_vehicles
+        self.use_file: bool = not args.live_cloud and INTERACTIVE
+        self.api: AnkerSolixApi | None = None
+        self.site_selected: str | None = args.site_id
+        self.device_names: list = []
+        self.device_filter: str | None = args.device_id
+        self.energy_stats: bool = args.energy_stats
+        self.refresh_interval: int = args.interval
+        self.endpoint_limit: int = args.endpoint_limit
+        self.debug_http: bool = args.debug_http
+        self.storage_path: Path = args.storage_root.expanduser()
+        self.sample_interval: int = args.sample_interval
+        self.next_refr: datetime
+        self.next_dev_refr: int = 0
+        self.folderdict: dict = {}
+        self.loop: asyncio.AbstractEventLoop
+        self.print_task = None
+        self.input_task = None
+        self.pause_output = False
+        self.print_task = None
+        self.input_task = None
+        self.storage_root: Path = args.storage_root.expanduser()
+        self.sample_interval: int = args.sample_interval
+        self.storage_task: asyncio.Task | None = None
+
+        self._last_storage_flat: dict[str, object] | None = None
+        self._last_storage_write: datetime | None = None
+        self._last_storage_path: Path | None = None
+        self.storage_heartbeat_interval: int = 10800
+        
+        self.api_retry_interval: int = args.api_retry_interval
+        self.energy_rate_limit_backoff: int = args.energy_rate_limit_backoff
+
+        self.api_backoff_until: datetime | None = None
+        self.energy_backoff_until: datetime | None = None
+        self.last_transient_error: str | None = None
+
+        # Built-in static webserver
+        self.web_folder: Path | None = args.web_folder.expanduser() if args.web_folder else None
+        self.web_host: str = args.web_host
+        self.web_port: int = args.web_port
+        self.web_runner: web.AppRunner | None = None
+    
+    
+    
+    def is_rate_limit_error(self, err: BaseException) -> bool:
+        """Return True if the error looks like an API rate-limit response."""
+        text = f"{type(err).__name__}: {err}"
+
+        return (
+            isinstance(err, RequestLimitError)
+            or "429" in text
+            or "Too Many Requests" in text
+            or "Request too soon" in text
+            or "exceeded request limit" in text
+        )
+
+
+    def is_energy_analysis_error(self, err: BaseException) -> bool:
+        """Return True if the failing endpoint appears to be energy_analysis."""
+        text = f"{type(err).__name__}: {err}"
+        return "energy_analysis" in text
+
+
+    def is_transient_api_error(self, err: BaseException) -> bool:
+        """Return True for errors that should not stop the monitor."""
+        if isinstance(err, (ClientError, AnkerSolixError, asyncio.TimeoutError)):
+            return True
+
+        return self.is_rate_limit_error(err)
+
+
+    def schedule_api_retry(self, err: BaseException, context: str = "API refresh") -> None:
+        """Schedule a later retry after a temporary API error."""
+        now = datetime.now().astimezone()
+
+        retry_seconds = self.api_retry_interval
+
+        if self.is_rate_limit_error(err):
+            retry_seconds = max(retry_seconds, 120)
+
+        self.api_backoff_until = now + timedelta(seconds=retry_seconds)
+        self.next_refr = self.api_backoff_until
+
+        # Avoid immediate details refresh retry storm.
+        self.next_dev_refr = max(self.next_dev_refr, 1)
+
+        if self.is_energy_analysis_error(err):
+            self.energy_backoff_until = now + timedelta(
+                seconds=max(self.energy_rate_limit_backoff, retry_seconds)
+            )
+
+        self.last_transient_error = f"{type(err).__name__}: {err}"
+
+        CONSOLE.warning(
+            "%s failed temporarily: %s: %s",
+            context,
+            type(err).__name__,
+            err,
+        )
+
+        if self.is_rate_limit_error(err):
+            CONSOLE.warning(
+                "API rate limit detected. Retrying after %s second(s), at %s.",
+                retry_seconds,
+                self.api_backoff_until.strftime("%Y-%m-%d %H:%M:%S %Z"),
+            )
+        else:
+            CONSOLE.warning(
+                "Temporary API/device communication problem. Retrying after %s second(s), at %s.",
+                retry_seconds,
+                self.api_backoff_until.strftime("%Y-%m-%d %H:%M:%S %Z"),
+            )
+
+        if self.energy_backoff_until:
+            CONSOLE.warning(
+                "Energy statistics backoff active until %s.",
+                self.energy_backoff_until.strftime("%Y-%m-%d %H:%M:%S %Z"),
+            )
+
+        if self.api:
+            CONSOLE.info("Api Requests: %s", self.api.request_count)
+            CONSOLE.log(
+                logging.INFO if self.showApiCalls else logging.DEBUG,
+                self.api.request_count.get_details(last_hour=True),
+            )
+
+
+    def energy_refresh_allowed(self) -> bool:
+        """Return True if energy refresh is currently allowed."""
+        if not self.energy_backoff_until:
+            return True
+
+        now = datetime.now().astimezone()
+
+        if now >= self.energy_backoff_until:
+            self.energy_backoff_until = None
+            return True
+
+        return False
+        
+            
+    def get_storage_path(self, timestamp: datetime | None = None) -> Path:
+        """Return monthly JSONL storage path: <root>/<year>/<year>-<month>.jsonl."""
+        timestamp = timestamp or datetime.now().astimezone()
+
+        year = timestamp.strftime("%Y")
+        month = timestamp.strftime("%m")
+
+        return self.storage_root / year / f"{year}-{month}.jsonl"
+
+    def get_subfolders(self, folder: str | Path) -> list:
+        """Get the full pathname of all subfolder for given folder as list."""
+        if isinstance(folder, str):
+            folder: Path = Path(folder)
+        if folder.is_dir():
+            return [f.resolve() for f in folder.iterdir() if f.is_dir()]
+        return []
+
+    STORAGE_EMPTY_STRINGS = {
+        "",
+        "Unknown",
+        "unknown",
+        "----",
+        "---",
+        "--",
+        "--.--",
+        "-.--",
+        "----.--",
+        "-------",
+        "----------",
+    }
+
+    SITE_ENERGY_KEYS = (
+        "home_load_power",
+        "other_loads_power",
+        "third_party_pv",
+        "switch_0w",
+        "data_valid",
+        "energy_offset_seconds",
+        "energy_offset_tz",
+    )
+
+    SOLARBANK_TOTAL_KEYS = (
+        "updated_time",
+        "total_battery_power",
+        "battery_discharge_power",
+        "total_photovoltaic_power",
+        "total_pv_input_power",
+        "total_charging_power",
+        "total_output_power",
+        "to_home_load",
+        "total_home_load_power",
+        "power_unit",
+    )
+
+    SMART_PLUG_TOTAL_KEYS = (
+        "total_power",
+        "power_unit",
+    )
+
+    TARIFF_KEYS = (
+        "price",
+        "site_price_unit",
+        "price_type",
+    )
+
+    DYNAMIC_PRICE_KEYS = (
+        "dynamic_price_total",
+        "spot_price_mwh",
+        "spot_price_mwh_avg_today",
+        "spot_price_mwh_avg_tomorrow",
+        "spot_price_unit",
+        "spot_price_time",
+        "dynamic_price_fee",
+        "dynamic_price_vat",
+        "dynamic_price_poll_time",
+        "dynamic_price_calc_time",
+    )
+
+    DEVICE_ENERGY_KEYS = (
+        # Static identifiers, stored once in first full record or when changed
+        "name",
+        "alias",
+        "type",
+        "device_pn",
+        "site_id",
+
+        # Live / energy-relevant values
+        "battery_soc",
+        "battery_energy",
+        "charging_status",
+        "charging_power",
+        "input_power",
+        "output_power",
+        "current_power",
+        "generate_power",
+        "ac_power",
+        "home_load_power",
+        "to_home_load",
+
+        # Solar
+        "solar_power_1",
+        "solar_power_2",
+        "solar_power_3",
+        "solar_power_4",
+        "photovoltaic_power",
+        "photovoltaic_to_grid_power",
+
+        # Battery
+        "bat_charge_power",
+        "bat_discharge_power",
+        "battery_charge",
+        "battery_discharge",
+        "battery_power",
+        "grid_to_battery_power",
+
+        # Grid / meter
+        "grid_to_home_power",
+        "grid_import_energy",
+        "grid_export_energy",
+
+        # Smart plugs
+        "energy_today",
+        "energy_last_period",
+    )
+
+    MQTT_ENERGY_KEYS = (
+        # Live power
+        "photovoltaic_power",
+        "pv_power_total",
+        "pv_power_3rd_party",
+        "pv_1_power",
+        "pv_2_power",
+        "pv_3_power",
+        "pv_4_power",
+
+        "output_power",
+        "output_power_total",
+        "ac_output_power",
+        "ac_output_power_signed",
+        "ac_output_power_signed_total",
+
+        "home_demand",
+        "home_demand_total",
+        "home_demand_other",
+
+        "grid_power_signed",
+        "grid_to_home_power",
+        "pv_to_grid_power",
+
+        # Battery
+        "battery_soc",
+        "battery_soc_total",
+        "battery_power_signed",
+        "battery_power_signed_total",
+        "bat_charge_power",
+        "bat_discharge_power",
+        "charged_energy",
+        "discharged_energy",
+
+        # Energy today
+        "pv_yield",
+        "pv_yield_today",
+        "output_energy",
+        "charged_energy_today",
+        "discharged_energy_today",
+        "home_consumption_today",
+        "pv_consumption_today",
+        "battery_consumption_today",
+        "grid_consumption_today",
+        "grid_import_today",
+        "grid_export_today",
+        "pv_export_today",
+
+        # Smart meter phases
+        "grid_power_signed_l1",
+        "grid_power_signed_l2",
+        "grid_power_signed_l3",
+        "voltage_l1",
+        "voltage_l2",
+        "voltage_l3",
+        "current_l1",
+        "current_l2",
+        "current_l3",
+
+        # EV charger
+        "charging_power",
+        "charging_energy",
+        "power_l1",
+        "power_l2",
+        "power_l3",
+        "charging_energy_l1",
+        "charging_energy_l2",
+        "charging_energy_l3",
+    )
+
+    def _is_empty_storage_value(self, value: object) -> bool:
+        """Return True if a value should not be stored."""
+        if value is None:
+            return True
+        if isinstance(value, str) and value.strip() in self.STORAGE_EMPTY_STRINGS:
+            return True
+        return False
+
+    def _clean_storage_value(self, value: object) -> object | None:
+        """Recursively remove empty values from dicts/lists."""
+        if isinstance(value, dict):
+            cleaned = {
+                key: cleaned_value
+                for key, item in value.items()
+                if (cleaned_value := self._clean_storage_value(item)) is not None
+            }
+            return cleaned or None
+
+        if isinstance(value, list):
+            cleaned = [
+                cleaned_item
+                for item in value
+                if (cleaned_item := self._clean_storage_value(item)) is not None
+            ]
+            return cleaned or None
+
+        if self._is_empty_storage_value(value):
+            return None
+
+        return value
+
+    def _pick_storage_keys(self, data: dict, keys: tuple[str, ...]) -> dict:
+        """Pick and clean selected keys from a dictionary."""
+        result = {}
+
+        for key in keys:
+            if key in data:
+                cleaned = self._clean_storage_value(data.get(key))
+                if cleaned is not None:
+                    result[key] = cleaned
+
+        return result
+
+    def _flatten_storage_payload(
+        self,
+        value: object,
+        prefix: str = "",
+    ) -> dict[str, object]:
+        """Flatten nested dict/list data to path-value pairs for delta storage."""
+        result: dict[str, object] = {}
+
+        if isinstance(value, dict):
+            for key, item in value.items():
+                path = f"{prefix}.{key}" if prefix else str(key)
+                result.update(self._flatten_storage_payload(item, path))
+            return result
+
+        if isinstance(value, list):
+            for idx, item in enumerate(value):
+                path = f"{prefix}.{idx}" if prefix else str(idx)
+                result.update(self._flatten_storage_payload(item, path))
+            return result
+
+        result[prefix] = value
+        return result
+
+    def build_storage_payload(self) -> dict:
+        """Build compact energy-only payload without timestamp.
+
+        This payload is later flattened and compared with the previous payload.
+        Only changed values are written to disk.
+        """
+        if not self.api:
+            return {}
+
+        sites_payload: dict = {}
+        devices_payload: dict = {}
+
+        filtered_sites = {
+            site_id: site
+            for site_id, site in self.api.sites.items()
+            if not self.site_selected or site_id == self.site_selected
+        }
+
+        filtered_devices = {
+            sn: dev
+            for sn, dev in self.api.devices.items()
+            if (not self.site_selected or dev.get("site_id") == self.site_selected)
+            and (not self.device_filter or self.device_filter == sn)
+        }
+
+        for site_id, site in filtered_sites.items():
+            site_record: dict = {}
+
+            # A few direct live values from site cache
+            site_record.update(self._pick_storage_keys(site, self.SITE_ENERGY_KEYS))
+
+            # Solarbank totals
+            for info_key in ("solarbank_info", "solarbank_pps_info"):
+                info = site.get(info_key) or {}
+                picked = self._pick_storage_keys(info, self.SOLARBANK_TOTAL_KEYS)
+                if picked:
+                    site_record[info_key] = picked
+
+            # Smart plug total site power
+            smart_plug_info = site.get("smart_plug_info") or {}
+            picked_smart_plugs = self._pick_storage_keys(
+                smart_plug_info,
+                self.SMART_PLUG_TOTAL_KEYS,
+            )
+            if picked_smart_plugs:
+                site_record["smart_plug_info"] = picked_smart_plugs
+
+            # Daily energy statistics, only if available
+            energy_details = site.get("energy_details") or {}
+            energy_record: dict = {}
+
+            for section in ("today", "last_period", "pv_forecast_details"):
+                cleaned = self._clean_storage_value(energy_details.get(section) or {})
+                if cleaned is not None:
+                    energy_record[section] = cleaned
+
+            if energy_record:
+                site_record["energy_details"] = energy_record
+
+            # Lifetime statistics, compact; delta storage prevents repetition
+            statistics = self._clean_storage_value(site.get("statistics") or [])
+            if statistics is not None:
+                site_record["statistics"] = statistics
+
+            # Tariff / price information
+            details = site.get("site_details") or {}
+            tariff = self._pick_storage_keys(details, self.TARIFF_KEYS)
+
+            dynamic_price_details = details.get("dynamic_price_details") or {}
+            dynamic_price = self._pick_storage_keys(
+                dynamic_price_details,
+                self.DYNAMIC_PRICE_KEYS,
+            )
+
+            if dynamic_price:
+                tariff["dynamic_price_details"] = dynamic_price
+
+            if tariff:
+                site_record["tariff"] = tariff
+
+            cleaned_site_record = self._clean_storage_value(site_record)
+            if cleaned_site_record is not None:
+                sites_payload[site_id] = cleaned_site_record
+
+        for sn, dev in filtered_devices.items():
+            dev_record: dict = {}
+
+            # Direct API device energy values
+            dev_record.update(self._pick_storage_keys(dev, self.DEVICE_ENERGY_KEYS))
+
+            # Average power block, useful for HES / PowerPanel
+            average_power = self._clean_storage_value(dev.get("average_power") or {})
+            if average_power is not None:
+                dev_record["average_power"] = average_power
+
+            # Device-specific daily energy details
+            energy_details = dev.get("energy_details") or {}
+            energy_record: dict = {}
+
+            for section in ("today", "last_period"):
+                cleaned = self._clean_storage_value(energy_details.get(section) or {})
+                if cleaned is not None:
+                    energy_record[section] = cleaned
+
+            if energy_record:
+                dev_record["energy_details"] = energy_record
+
+            # MQTT-derived live values, if available
+            mqtt_data = dev.get("mqtt_data") or {}
+            mqtt_record = self._pick_storage_keys(mqtt_data, self.MQTT_ENERGY_KEYS)
+            if mqtt_record:
+                dev_record["mqtt"] = mqtt_record
+
+            cleaned_dev_record = self._clean_storage_value(dev_record)
+            if cleaned_dev_record is not None:
+                devices_payload[sn] = cleaned_dev_record
+
+        payload: dict = {}
+
+        if sites_payload:
+            payload["sites"] = sites_payload
+
+        if devices_payload:
+            payload["devices"] = devices_payload
+
+        return payload
+
+    async def write_storage_snapshot(self) -> None:
+        """Append only changed compact energy values as one JSONL record.
+
+        Data is stored in monthly files:
+
+            <storage-root>/<year>/<year>-<month>.jsonl
+
+        On month/file rollover a full record is written, so every monthly file
+        can be interpreted independently.
+        """
+        payload = self.build_storage_payload()
+        if not payload:
+            return
+
+        now = datetime.now().astimezone()
+        storage_path = self.get_storage_path(now)
+
+        file_changed = (
+            self._last_storage_path is not None
+            and storage_path != self._last_storage_path
+        )
+
+        monthly_file_missing = not storage_path.exists()
+
+        current_flat = self._flatten_storage_payload(payload)
+        if not current_flat:
+            return
+
+        file_changed = self._last_storage_path is not None and storage_path != self._last_storage_path
+
+        heartbeat_due = (
+            self.storage_heartbeat_interval > 0
+            and self._last_storage_write is not None
+            and (now - self._last_storage_write).total_seconds()
+            >= self.storage_heartbeat_interval
+        )
+
+        if self._last_storage_flat is None or file_changed or monthly_file_missing:
+            # First write ever, first write after month rollover,
+            # or first write into a missing monthly file.
+            #
+            # This guarantees that every monthly JSONL file starts with
+            # a complete full snapshot and can be read independently.
+            mode = "full"
+            changed_values = current_flat
+            removed_values: list[str] = []
+
+        elif heartbeat_due:
+            # Periodic absolute snapshot, not only changed values.
+            mode = "full"
+            changed_values = current_flat
+            removed_values = [
+                key
+                for key in self._last_storage_flat
+                if key not in current_flat
+            ]
+
+        else:
+            mode = "delta"
+            changed_values = {
+                key: value
+                for key, value in current_flat.items()
+                if self._last_storage_flat.get(key) != value
+            }
+            removed_values = [
+                key
+                for key in self._last_storage_flat
+                if key not in current_flat
+            ]
+        if not changed_values and not removed_values:
+            return
+
+        record = {
+            "schema": "anker-solix-energy-delta.v1",
+            "timestamp": now.isoformat(),
+            "timestamp_unix": now.timestamp(),
+            "source": "file" if self.use_file else "cloud",
+            "mode": mode,
+            "values": changed_values,
+        }
+
+        if removed_values:
+            record["removed"] = removed_values
+
+        storage_path.parent.mkdir(parents=True, exist_ok=True)
+
+        line = json.dumps(
+            record,
+            ensure_ascii=False,
+            default=str,
+            separators=(",", ":"),
+        )
+
+        def append_line() -> None:
+            with storage_path.open("a", encoding="utf-8") as file:
+                file.write(line + "\n")
+
+        await asyncio.to_thread(append_line)
+
+        self._last_storage_flat = current_flat
+        self._last_storage_write = now
+        self._last_storage_path = storage_path
+        
+    async def storage_loop(self) -> None:
+        """Continuously store changed energy values as compact JSONL deltas."""
+        CONSOLE.info(
+            "Storage enabled: checking every %s second(s), writing monthly JSONL files below %s",
+            self.sample_interval,
+            self.storage_root,
+        )
+
+        try:
+            while True:
+                await self.write_storage_snapshot()
+                await asyncio.sleep(self.sample_interval)
+        except asyncio.CancelledError:
+            CONSOLE.info("Storage task stopped.")
+            raise
+        except Exception as err:  # noqa: BLE001
+            CONSOLE.exception("Storage task failed: %s: %s", type(err), err)
+
+    def customize_cache(self) -> bool:
+        """Customize a key in the Api cache and restart device details refresh."""
+        CONSOLE.info("Site IDs and Device SNs for customization:")
+        cache: dict = self.api.sites | self.api.devices
+        for idx, item in enumerate(
+            itemlist := list(cache.keys()),
+            start=1,
+        ):
+            CONSOLE.info(
+                f"({Color.YELLOW}{idx}{Color.OFF}) {item} - {cache.get(item).get('name') or (cache.get(item).get('site_info') or {}).get('site_name')}"
+            )
+        while True:
+            select = input(
+                f"Select {Color.YELLOW}ID{Color.OFF} or [{Color.RED}C{Color.OFF}]ancel: "
+            )
+            if not select or select.upper() in ["C", "CANCEL", ""]:
+                break
+            if select.isdigit() and 1 <= (select := int(select)) <= len(itemlist):
+                break
+        if isinstance(select, int):
+            item = itemlist[select - 1]
+            key = input(
+                f"Enter {Color.CYAN}key{Color.OFF} to be customized in '{Color.YELLOW}{item}{Color.OFF}': "
+            )
+            value = input(
+                f"Enter '{Color.YELLOW}{key}{Color.OFF}' {Color.CYAN}value{Color.OFF} in JSON format: "
+            )
+            if value := json.loads(value.replace("'", '"') or "{}"):
+                self.api.customizeCacheId(id=item, key=key, value=value)
+                CONSOLE.info(
+                    f"Customized part of {Color.YELLOW}{item}{Color.OFF}:\n"
+                    f"{json.dumps(self.api.getCaches().get(item).get('customized') or {}, indent=2)}"
+                )
+            else:
+                CONSOLE.info(f"{Color.RED}Invalid value for customization!{Color.OFF}")
+            input(f"Hit [{Color.YELLOW}Enter{Color.OFF}] to refresh all data...")
+            self.next_dev_refr = 0
+            self.next_refr = datetime.now().astimezone()
+            return True
+        return False
+
+    def _filtered_sites_for_console(self) -> list[tuple[str, dict]]:
+            """Return sites matching the active site filter."""
+            if not self.api:
+                return []
+
+            return [
+                (site_id, site)
+                for site_id, site in self.api.sites.items()
+                if not self.site_selected or site_id == self.site_selected
+            ]
+
+
+    def _filtered_devices_for_console(self) -> list[tuple[str, dict]]:
+        """Return devices matching active site/device filters."""
+        if not self.api:
+            return []
+
+        return [
+            (sn, dev)
+            for sn, dev in self.api.devices.items()
+            if (not self.site_selected or dev.get("site_id") == self.site_selected)
+            and (not self.device_filter or self.device_filter == sn)
+        ]
+
+
+    def _first_value(self, data: dict, keys: tuple[str, ...], default: object = "----") -> object:
+        """Return first non-empty value from keys."""
+        for key in keys:
+            value = data.get(key)
+
+            if value is not None and value != "":
+                return value
+
+        return default
+
+
+    def _site_power_block(self, site: dict) -> dict:
+        """Extract compact site power values."""
+        solarbank = (
+            site.get("solarbank_info")
+            or site.get("solarbank_pps_info")
+            or {}
+        )
+
+        return {
+            "updated": solarbank.get("updated_time") or "Unknown",
+            "soc": solarbank.get("total_battery_power"),
+            "pv": (
+                solarbank.get("total_photovoltaic_power")
+                or solarbank.get("total_pv_input_power")
+            ),
+            "charge": solarbank.get("total_charging_power"),
+            "discharge": solarbank.get("battery_discharge_power"),
+            "output": solarbank.get("total_output_power"),
+            "home": (
+                solarbank.get("to_home_load")
+                or solarbank.get("total_home_load_power")
+                or site.get("home_load_power")
+            ),
+            "unit": solarbank.get("power_unit") or "W",
+            "valid": site.get("data_valid"),
+        }
+
+
+    def print_minimal_console_data(self) -> None:
+        """Print minimal system-level console dashboard."""
+        if not self.api:
+            return
+
+        CONSOLE.info("=" * 80)
+        CONSOLE.info(
+            "Anker Solix Monitor - minimal view - refresh %s s",
+            self.refresh_interval,
+        )
+
+        for site_id, site in self._filtered_sites_for_console():
+            site_name = (site.get("site_info") or {}).get("site_name", "Unknown")
+            block = self._site_power_block(site)
+            unit = block["unit"]
+
+            soc = block["soc"]
+            if soc is not None:
+                try:
+                    soc_text = f"{float(soc) * 100:.0f} %"
+                except (TypeError, ValueError):
+                    soc_text = f"{soc} %"
+            else:
+                soc_text = "--- %"
+
+            CONSOLE.info("-" * 80)
+            CONSOLE.info("System: %s  (Site ID: %s)", site_name, site_id)
+            CONSOLE.info(
+                "PV: %s %s | Home: %s W | Output: %s %s | Battery: %s | Updated: %s",
+                block["pv"] or "----",
+                unit,
+                block["home"] or "----",
+                block["output"] or "----",
+                unit,
+                soc_text,
+                block["updated"],
+            )
+
+        CONSOLE.info("=" * 80)
+
+
+    def print_compact_console_data(self) -> None:
+        """Print compact system and device console dashboard."""
+        if not self.api:
+            return
+
+        CONSOLE.info("=" * 80)
+        CONSOLE.info(
+            "Anker Solix Monitor - compact view - refresh %s s, details countdown %s",
+            self.refresh_interval,
+            self.next_dev_refr,
+        )
+        CONSOLE.info(
+            "Sites: %s, Devices: %s, Device Filter: %s",
+            len(self.api.sites),
+            len(self.api.devices),
+            self.device_filter or "All",
+        )
+
+        for site_id, site in self._filtered_sites_for_console():
+            site_name = (site.get("site_info") or {}).get("site_name", "Unknown")
+            block = self._site_power_block(site)
+            unit = block["unit"]
+
+            soc = block["soc"]
+            if soc is not None:
+                try:
+                    soc_text = f"{float(soc) * 100:.0f} %"
+                except (TypeError, ValueError):
+                    soc_text = f"{soc} %"
+            else:
+                soc_text = "--- %"
+
+            CONSOLE.info("-" * 80)
+            CONSOLE.info("System: %s  (Site ID: %s)", site_name, site_id)
+            CONSOLE.info(
+                "PV: %s %s | Charge: %s W | Discharge: %s W | Home: %s W | SoC: %s",
+                block["pv"] or "----",
+                unit,
+                block["charge"] or "----",
+                block["discharge"] or "----",
+                block["home"] or "----",
+                soc_text,
+            )
+            CONSOLE.info(
+                "Output: %s %s | Data valid: %s | Updated: %s",
+                block["output"] or "----",
+                unit,
+                "YES" if block["valid"] else "NO" if block["valid"] is False else "---",
+                block["updated"],
+            )
+
+            site_devices = [
+                (sn, dev)
+                for sn, dev in self._filtered_devices_for_console()
+                if dev.get("site_id") == site_id
+            ]
+
+            if site_devices:
+                CONSOLE.info("Devices:")
+
+            for sn, dev in site_devices:
+                name = dev.get("name") or dev.get("alias") or "Unknown"
+                pn = dev.get("device_pn") or "----"
+                devtype = dev.get("type") or "unknown"
+
+                pv = self._first_value(
+                    dev,
+                    (
+                        "input_power",
+                        "photovoltaic_power",
+                        "generate_power",
+                        "solar_power_1",
+                    ),
+                )
+                output = self._first_value(
+                    dev,
+                    (
+                        "output_power",
+                        "to_home_load",
+                        "current_power",
+                        "ac_power",
+                    ),
+                )
+                soc = self._first_value(dev, ("battery_soc",), "---")
+                charge = self._first_value(
+                    dev,
+                    (
+                        "bat_charge_power",
+                        "charging_power",
+                    ),
+                )
+                discharge = self._first_value(
+                    dev,
+                    (
+                        "bat_discharge_power",
+                        "battery_discharge_power",
+                    ),
+                )
+
+                CONSOLE.info(
+                    "  %-22s [%s] %-16s SN: %s",
+                    str(name)[:22],
+                    pn,
+                    str(devtype)[:16],
+                    sn,
+                )
+                CONSOLE.info(
+                    "    PV: %s W | Out: %s W | Charge: %s W | Discharge: %s W | SoC: %s %%",
+                    pv,
+                    output,
+                    charge,
+                    discharge,
+                    soc,
+                )
+
+        CONSOLE.info("=" * 80)
+
+
+    def print_console_data(self) -> None:
+        """Print console dashboard according to configured detail level."""
+        if not self.console_enabled:
+            return
+
+        if self.console_detail == "silent":
+            return
+
+        if self.console_detail == "minimal":
+            self.print_minimal_console_data()
+            return
+
+        if self.console_detail == "compact":
+            self.print_compact_console_data()
+            return
+
+        # full = existing detailed output
+        self.print_api_data()
+            
+            
+    def print_api_data(self) -> None:  # noqa: C901
+        """Print the Api data in formatted structures."""
+        if self.pause_output or not self.api:
+            return
+        col1 = 15
+        col2 = 23
+        col3 = 15
+        # define colors
+        co = Color.OFF
+        cc = Color.MAG  # calculated values
+        shown_sites = set()
+        # print header
+        if self.use_file:
+            CONSOLE.info("Using input source folder: %s", self.api.testDir())
+        CONSOLE.info(
+            "Anker Solix Monitor (refresh %s s, details refresh countdown %s):",
+            self.refresh_interval,
+            self.next_dev_refr,
+        )
+        CONSOLE.info(
+            "Sites: %s, Devices: %s, Device Filter: %s",
+            len(self.api.sites),
+            len(self.api.devices),
+            f"{Color.MAG}{self.device_filter!s}{Color.OFF}",
+        )
+        grouped = {}
+        for sn, dev in self.api.devices.items():
+            if (site := dev.get("site_id", "")) not in self.api.sites:
+                site = ""
+            grouped[site] = [*grouped.get(site, []), sn]
+        for sn, dev in [
+            (sn, self.api.devices[sn])
+            for site, sns in grouped.items()
+            if (not self.site_selected or site == self.site_selected)
+            for sn in sns
+            if (not self.device_filter or self.device_filter == sn)
+        ]:
+            devtype = dev.get("type", "Unknown")
+            admin = dev.get("is_admin", False)
+            siteid = dev.get("site_id", "")
+            site = self.api.sites.get(siteid) or {}
+            customized = dev.get("customized") or {}
+            mqtt = {}
+            c = ""
+            cm = ""
+            if not (siteid and siteid in shown_sites):
+                CONSOLE.info("=" * 80)
+                if siteid:
+                    shown_sites.add(siteid)
+                    shift = site.get("energy_offset_tz")
+                    shift = (
+                        " --:--"
+                        if shift is None
+                        else f"{(shift // 3600):0=+3.0f}:{(shift % 3600 // 60) if shift else 0:0=z2.0f}"
+                    )
+                    CONSOLE.info(
+                        f"{Color.YELLOW}{'System (' + shift + ')':<{col1}}: {(site.get('site_info') or {}).get('site_name', 'Unknown')}  (Site ID: {siteid}){co}"
+                    )
+                    site_type = str(site.get("site_type", ""))
+                    CONSOLE.info(
+                        f"{'Type ID':<{col1}}: {str((site.get('site_info') or {}).get('power_site_type', '--')) + (' (' + site_type.capitalize() + ')') if site_type else '':<{col2}} "
+                        f"Device Models  : {','.join((site.get('site_info') or {}).get('current_site_device_models', []))}"
+                    )
+                    offset = site.get("energy_offset_seconds")
+                    CONSOLE.info(
+                        f"{'Energy Time':<{col1}}: {'----.--.-- --:--:--' if offset is None else (datetime.now() + timedelta(seconds=offset)).strftime('%Y-%m-%d %H:%M:%S'):<{col2}} "
+                        f"{'Last Check':<{col3}}: {site.get('energy_offset_check') or '----.--.-- --:--:--'}"
+                    )
+                    if (
+                        (sb := site.get("solarbank_info") or {})
+                        and len(sb.get("solarbank_list") or []) > 0
+                    ) or (
+                        (sb := site.get("solarbank_pps_info") or {})
+                        and len(sb.get("pps_list") or []) > 0
+                    ):
+                        # print solarbank or solarbank_pps totals
+                        soc = f"{int(float(sb.get('total_battery_power') or 0) * (1 if site.get('site_type') == SolixDeviceType.SOLARBANK_PPS.value else 100))!s:>4} %"
+                        unit = sb.get("power_unit") or "W"
+                        update_time = sb.get("updated_time") or "Unknown"
+                        CONSOLE.info(
+                            f"{'Cloud-Updated':<{col1}}: {update_time:<{col2}} "
+                            f"{'Valid Data':<{col3}}: {'YES' if site.get('data_valid') else 'NO'} (Requeries: {site.get('requeries')})"
+                        )
+                        CONSOLE.info(
+                            f"{'SoC Total':<{col1}}: {soc:<{col2}} "
+                            f"{'Dischrg Pwr Tot':<{col3}}: {sb.get('battery_discharge_power', '----'):>4} {unit}"
+                        )
+                        CONSOLE.info(
+                            f"{'Solar  Pwr Tot':<{col1}}: {sb.get('total_photovoltaic_power') or sb.get('total_pv_input_power') or '----'!s:>4} {unit:<{col2 - 5}} "
+                            f"{'Battery Pwr Tot':<{col3}}: {str(sb.get('total_charging_power')).split('.', maxsplit=1)[0]:>4} W"
+                        )
+                        CONSOLE.info(
+                            f"{'Output Pwr Tot':<{col1}}: {str(sb.get('total_output_power', '----')).split('.', maxsplit=1)[0]:>4} {unit:<{col2 - 5}} "
+                            f"{'Home Load Tot':<{col3}}: {sb.get('to_home_load') or sb.get('total_home_load_power') or '----':>4} W"
+                        )
+                        if "third_party_pv" in site:
+                            CONSOLE.info(
+                                f"{'Ext PV Surplus':<{col1}}: {site.get('third_party_pv') or '----'!s:>4} {unit:<{col2 - 5}} "
+                                f"{'Switch 0W':<{col3}}: {'ON' if site.get('switch_0w') else 'OFF'}"
+                            )
+                        # System config and power limit
+                        details = site.get("site_details") or {}
+                        if "legal_power_limit" in details:
+                            CONSOLE.info(
+                                f"{'Legal Pwr Limit':<{col1}}: {details.get('legal_power_limit', '----'):>4} {unit:<{col2 - 5}} "
+                                f"{'Parallel Type':<{col3}}: {(details.get('parallel_type') or '---------')!s}"
+                            )
+                        features = site.get("feature_switch") or {}
+                        if mode := site.get("scene_mode") or site.get(
+                            "user_scene_mode"
+                        ):
+                            mode_name = get_enum_name(
+                                SolarbankUsageMode, mode, "Unknown" if mode else None
+                            )
+                            feat1 = features.get("heating")
+                            CONSOLE.info(
+                                f"{'Active Mode':<{col1}}: {str(mode_name).capitalize() + ' (' + str(mode) + ')' if mode_name else '---------':<{col2}} "
+                                f"{'Heating':<{col3}}: {'ON' if feat1 else '---' if feat1 is None else 'OFF'}"
+                            )
+                        if "offgrid_with_micro_inverter_alert" in features:
+                            feat1 = features.get("offgrid_with_micro_inverter_alert")
+                            feat2 = features.get("micro_inverter_power_exceed")
+                            CONSOLE.info(
+                                f"{'Offgrid Alert':<{col1}}: {'ON' if feat1 else '---' if feat1 is None else 'OFF':<{col2}} "
+                                f"{'Inv. Pwr Exceed':<{col3}}: {'ON' if feat2 else '---' if feat2 is None else 'OFF'}"
+                            )
+                    if (hes := site.get("hes_info") or {}) and len(
+                        hes.get("hes_list", [])
+                    ) > 0:
+                        # print hes totals
+                        CONSOLE.info(
+                            f"{'Parallel Devs':<{col1}}: {hes.get('numberOfParallelDevice', '---'):>3} {'':<{col2 - 4}} "
+                            f"{'Battery count':<{col3}}: {hes.get('batCount', '---'):>3}"
+                        )
+                        CONSOLE.info(
+                            f"{'Main SN':<{col1}}: {hes.get('main_sn', 'unknown'):<{col2}} "
+                            f"{'System Code':<{col3}}: {hes.get('systemCode', 'unknown')} ({hes.get('countryCode', '--')})"
+                        )
+                        feat1 = hes.get("connected")
+                        CONSOLE.info(
+                            f"{'Connected':<{col1}}: {'YES' if feat1 else '---' if feat1 is None else ' NO':>3} {'':<{col2 - 4}} "
+                            f"{'Repost time':<{col3}}: {hes.get('rePostTime', '---'):>3} min?"
+                        )
+                        CONSOLE.info(
+                            f"{'Net status':<{col1}}: {hes.get('net', '---'):>3} {'':<{col2 - 4}} "
+                            f"{'Real net':<{col3}}: {hes.get('realNet', '---'):>3}"
+                        )
+                        feat1 = hes.get("isAddHeatPump")
+                        feat2 = hes.get("supportDiesel")
+                        CONSOLE.info(
+                            f"{'Has heat pump':<{col1}}: {'YES' if feat1 else '---' if feat1 is None else ' NO':>3} {'':<{col2 - 4}} "
+                            f"{'Support diesel':<{col3}}: {'YES' if feat2 else '---' if feat2 is None else ' NO':>3}"
+                        )
+                        feat1 = hes.get("hasEvCharger")
+                        feat2 = hes.get("emsDisable")
+                        CONSOLE.info(
+                            f"{'Has EV Charger':<{col1}}: {'YES' if feat1 else '---' if feat1 is None else ' NO':>3} {'':<{col2 - 4}} "
+                            f"{'EMS Disable':<{col3}}: {'YES' if feat2 else '---' if feat2 is None else ' NO':>3}"
+                        )
+                    if ai_runtime := (site.get("site_details") or {}).get(
+                        "ai_ems_runtime"
+                    ):
+                        runtime = (
+                            timedelta(seconds=int(sec) * (-1))
+                            if str(sec := ai_runtime.get("left_time"))
+                            .replace("-", "")
+                            .replace(".", "")
+                            .isdigit()
+                            else None
+                        )
+                        status = ai_runtime.get("status")
+                        CONSOLE.info(
+                            f"{'AI Collection':<{col1}}: {('-' if runtime.days < 0 else '') + str(abs(runtime)):<{col2}} "
+                            f"{'Collect Status':<{col3}}: {str(ai_runtime.get('status_desc')).capitalize()} ({status})"
+                        )
+                    CONSOLE.info("-" * 80)
+            else:
+                CONSOLE.info("-" * 80)
+            CONSOLE.info(
+                f"{'Device [' + dev.get('device_pn', '') + ']':<{col1}}: {c or Color.MAG}{(dev.get('name', 'NoName').strip()):<{col2}}{co} "
+                f"{'Alias':<{col3}}: {c or Color.MAG}{dev.get('alias', 'Unknown')}{co}"
+            )
+            m1 = cm and mqtt.get("country_code", "")
+            CONSOLE.info(
+                f"{'Serial [' + (get_solix_product_code(sn) or '----') + ']':<{col1}}: {sn:<{col2}} {m1 and cm}{('(' + m1 + ')') if m1 else ''}"
+                f"{'Admin':<{col3}}: {'YES' if admin else 'NO'}"
+            )
+            if m1 := cm and mqtt.get("local_timestamp", 0):
+                m1 = datetime.fromtimestamp(m1).strftime("%Y-%m-%d %H:%M:%S")
+                m2 = cm and datetime.fromtimestamp(
+                    mqtt.get("utc_timestamp", 0)
+                ).strftime("%Y-%m-%d %H:%M:%S")
+                CONSOLE.info(
+                    f"{'Local Time':<{col1}}: {m1 and (c or cm)}{m1:<{col2}}{co} "
+                    f"{'UTC Time':<{col3}}: {m2 and (c or cm)}{m2}{co}"
+                )
+            if integrated := dev.get("intgr_device") or {}:
+                CONSOLE.info(
+                    f"{'Integrator':<{col1}}: {str(integrated.get('integrator')).capitalize():<{col2}} "
+                    f"{'Access Group':<{col3}}: {integrated.get('access_group')!s}"
+                )
+            for fsn, fitting in (dev.get("fittings") or {}).items():
+                CONSOLE.info(
+                    f"{'Accessory':<{col1}}: {fitting.get('device_name', ''):<{col2}} "
+                    f"{'Serialnumber':<{col3}}: {fsn}"
+                )
+            if not dev.get("is_passive") or mqtt:
+                wt = dev.get("wireless_type") or ""
+                net = (
+                    ((dev.get("relate_type") or [])[int(wt) : int(wt) + 1] or [""])[0]
+                    if str(wt).isdigit()
+                    else ""
+                )
+                CONSOLE.info(
+                    f"{'Wireless Type':<{col1}}: {(dev.get('wireless_type') or '') + (' (' + (net.capitalize() or 'Unknown') + ')') if wt else '':<{col2}} "
+                    f"{'Bluetooth MAC':<{col3}}: {dev.get('bt_ble_mac') or ''}"
+                )
+                CONSOLE.info(
+                    f"{'Wifi SSID':<{col1}}: {dev.get('wifi_name', ''):<{col2}} "
+                    f"{'Wifi MAC':<{col3}}: {dev.get('wifi_mac') or ''}"
+                )
+                online = dev.get("wifi_online")
+                m2 = c and mqtt.get("wifi_signal", "")
+                CONSOLE.info(
+                    f"{'Wifi State':<{col1}}: {('Unknown' if online is None else 'Online' if online else 'Offline'):<{col2}} "
+                    f"{'Signal':<{col3}}: {m2 and c}{m2 or dev.get('wifi_signal') or '---':>4} %{co} ({dev.get('rssi') or '---'} dBm)"
+                )
+                if support := dev.get("is_support_wired"):
+                    online = dev.get("wired_connected")
+                    CONSOLE.info(
+                        f"{'Wired state':<{col1}}: {('Unknown' if online is None else 'Connected' if online else 'Disconnected'):<{col2}} "
+                        f"{'Support Wired':<{col3}}: {('Unknown' if support is None else 'YES' if support else 'NO')}"
+                    )
+                upgrade = dev.get("auto_upgrade")
+                ota = dev.get("is_ota_update")
+                m1 = c and mqtt.get("sw_version", "")
+                CONSOLE.info(
+                    f"{'SW Version':<{col1}}: {m1 and c}{(m1 or (dev.get('sw_version', 'Unknown')) + ' (' + ('Unknown' if ota is None else 'Updt' if ota else 'Ok') + ')'):<{col2}}{co} "
+                    f"{'Auto-Upgrade':<{col3}}: {'Unknown' if upgrade is None else 'Enabled' if upgrade else 'Disabled'} (OTA {dev.get('ota_version') or 'Unknown'})"
+                )
+                for item in dev.get("ota_children") or []:
+                    ota = item.get("need_update")
+                    forced = item.get("force_upgrade")
+                    CONSOLE.info(
+                        f"{' -Component':<{col1}}: {item.get('device_type', 'Unknown') + ' (' + ('Unknown' if ota is None else 'Updt' if ota else 'Ok') + ')':<{col2}} "
+                        f"{' -Version':<{col3}}: {item.get('rom_version_name') or 'Unknown'}{' (Forced)' if forced else ''}"
+                    )
+            if devtype == SolixDeviceType.COMBINER_BOX.value:
+                CONSOLE.info(
+                    f"{'Cloud Status':<{col1}}: {str(dev.get('status_desc', '-------')).capitalize():<{col2}} "
+                    f"{'Status Code':<{col3}}: {dev.get('status', '-')!s}"
+                )
+                CONSOLE.info(
+                    f"{'Dock Status':<{col1}}: {str(dev.get('dock_status_desc', '-------')).capitalize():<{col2}} "
+                    f"{'Status Code':<{col3}}: {dev.get('dock_status', '-')!s}"
+                )
+                unit = dev.get("power_unit", "W")
+                # print station details
+                m1 = c and mqtt.get("ac_output_power_signed", "")
+                m2 = c and mqtt.get("ac_input_limit_total", "")
+                if m1 or m2:
+                    CONSOLE.info(
+                        f"{'AC Output Power':<{col1}}:{m1 and c}{m1 or dev.get('current_power') or '----':>5} {unit:<{col2 - 5}}{co} "
+                        f"{'All AC In Limit':<{col3}}:{m2 and c}{m2 or dev.get('all_ac_input_limit') or '----':>5} W"
+                    )
+                m1 = c and str(mqtt.get("max_load_total", ""))
+                if isinstance(opt := dev.get("all_power_limit_option"), list):
+                    opt = [
+                        item
+                        for d in opt
+                        if isinstance(d, dict)
+                        for key, item in d.items()
+                        if key == "limit"
+                    ]
+                m3 = c and str(mqtt.get("max_load_limit_total", ""))
+                if m1 or opt or m3:
+                    CONSOLE.info(
+                        f"{'All Pwr Limit':<{col1}}:{m1 and c}{m1 or dev.get('all_power_limit', '----'):>5} {unit}{' (' + m3 + ' W)' if m3 else '':<{col2 - 6}}{co} "
+                        f"{'Pwr Limit Opt':<{col3}}: {opt or '----'!s}"
+                    )
+                feat1 = dev.get("allow_grid_export")
+                feat2 = dev.get("grid_export_limit") or "----"
+                m1 = (
+                    (
+                        c
+                        and (
+                            mqtt.get("output_cutoff_data", "")
+                            or mqtt.get("power_cutoff", "")
+                        )
+                    )
+                    or dev.get("discharge_lower_limit", "")
+                    or dev.get("power_cutoff", "")
+                    or dev.get("output_cutoff_data", "")
+                )
+                if m3 := ((c or cm) and str(mqtt.get("max_soc", ""))) or dev.get(
+                    "charge_upper_limit", ""
+                ):
+                    m3 = int(m3)
+                if m1 or str(m3) or feat1:
+                    CONSOLE.info(
+                        f"{'Min / Max SoC':<{col1}}: {m1 and (c or cm)}{(m1 or '--')!s:>4} %{co} / "
+                        f"{m3 and (c or cm)}{(str(m3) or '--')!s:>3} {'%':<{col2 - 13}}{co} "
+                        f"{'Grid export':<{col3}}: {'ON' if feat1 else '---' if feat1 is None else 'OFF':>4} (Limit {feat2} W)"
+                    )
+                m1 = (c or cm) and str(
+                    mqtt.get("backup_soc", "") or dev.get("backup_reserve", "")
+                )
+                m3 = (c or cm) and (
+                    mqtt.get("backup_soc_switch", "")
+                    or dev.get("backup_reserve_switch", "")
+                )
+                m2 = (c or cm) and str(mqtt.get("active_discharge_soc", ""))
+                m4 = (c or cm) and str(mqtt.get("active_charge_soc", ""))
+                if m1 or m2 or m3 or m4:
+                    CONSOLE.info(
+                        f"{'Backup SoC/Sw.':<{col1}}: {m1 and (c or cm)}{(m1 or '--')!s:>4} %  "
+                        f"({str(m3) and c}{get_enum_name(SolixSwitchMode, m3, str(m3) or '---').upper():>3}{')':<{col2 - 12}}{co} "
+                        f"{'Act SoC Min/Max':<{col3}}: {m2 and (c or cm)}{(m2 or '--')!s:>4} %{co} / {m4 and (c or cm)}{(m4 or '--')!s:>3} %{co}"
+                    )
+                unit = "W"
+                m1 = cm and mqtt.get("grid_power_signed", "")
+                m2 = cm and mqtt.get("ac_output_power", "")
+                if m1 or m2:
+                    CONSOLE.info(
+                        f"{'Grid Power':<{col1}}: {m1 and (c or cm)}{m1 or '----':>4} {unit:<{col2 - 5}}{co} "
+                        f"{'AC Home Pwr':<{col3}}: {m2 and (c or cm)}{m2 or '----':>4} {unit}{co}"
+                    )
+                if m1 := cm and mqtt.get("battery_soc_total", ""):
+                    CONSOLE.info(
+                        f"{'Battery SoC Tot':<{col1}}: {m1 and (c or cm)}{m1 or '---':>4} {'%':<{col2 - 5}}{co} "
+                        f"{'Max Load Legal':<{col3}}: {site.get('site_details', {}).get('legal_power_limit') or '----':>4} {unit}{co}"
+                    )
+                m1 = cm and mqtt.get("home_demand_total", "")
+                m2 = cm and (
+                    mqtt.get("device_output_power_signed_total", "")
+                    or mqtt.get("device_output_power_signed_total", "")
+                )
+                if m1 or m2:
+                    CONSOLE.info(
+                        f"{'Home Demand Tot':<{col1}}:{m1 and (c or cm)}{m1 or '----':>5} {unit:<{col2 - 5}}{co} "
+                        f"{'Dev Pwr Out Tot':<{col3}}:{m2 and (c or cm)}{m2 or '----':>5} {unit}{co}"
+                    )
+                m1 = cm and mqtt.get("pv_power_total", "")
+                m2 = cm and mqtt.get("battery_power_signed_total", "")
+                m3 = cm and mqtt.get("pv_power_3rd_party", "")
+                if m1 or m2:
+                    CONSOLE.info(
+                        f"{'PV Tot / Extern':<{col1}}:{m1 and (c or cm)}{m1 or '----':>5} {unit} /{m3 or '----':>5} {unit:<{col2 - 14}}{co} "
+                        f"{'Bat Power Total':<{col3}}:{m2 and (c or cm)}{m2 or '----':>5} {unit}{co}"
+                    )
+                m1 = cm and mqtt.get("generator_power", "")
+                m2 = cm and mqtt.get("generator_plug_status", "")
+                if m1 or str(m2):
+                    CONSOLE.info(
+                        f"{'Generator Power':<{col1}}:{m1 and (c or cm)}{m1 or '----':>5} {unit:<{col2 - 5}}{co} "
+                        f"{'Generator Plug':<{col3}}:{str(m2) and (c or cm)} {('Connected' if m2 == 1 else 'Disconnected' if m2 == 0 else 'Unknown')} ({'-' if m2 is None else str(m2)}){co}"
+                    )
+                for i in range(1, 7):
+                    if m1 := cm and mqtt.get(f"device_{i}_sn", ""):
+                        m2 = cm and mqtt.get(f"device_{i}_soc", "")
+                        soc = f"{m2 or '---':>4} %"
+                        m3 = cm and mqtt.get(f"device_{i}_pn", "")
+                        m4 = cm and mqtt.get(f"device_{i}_ac_output_power_signed", "")
+                        m5 = cm and mqtt.get(f"device_{i}_type", "")
+                        CONSOLE.info(
+                            f"{'Dev ' + str(i) + ('   [' + (c or cm) + m3 + co + ']' if m3 else ''):<{col1}}: "
+                            f"{m1 and (c or cm)}{m1 + (' (' + m5 + ')' if m5 else ''):<{col2}}{co} "
+                            f"{'Dev ' + str(i) + ' SoC / Out':<{col3}}: {m2 and (c or cm)}{soc} /{m4 or '----':>5} {unit}{co}"
+                        )
+                        m1 = cm and mqtt.get(f"device_{i}_pv_power", "")
+                        m2 = cm and mqtt.get(f"device_{i}_battery_power", "")
+                        if m1 or m2:
+                            CONSOLE.info(
+                                f"{'Dev ' + str(i) + ' PV Total':<{col1}}:{m1 and (c or cm)}{m1 or '----':>5} {unit:<{col2 - 5}}{co} "
+                                f"{'Dev ' + str(i) + ' Bat Pwr':<{col3}}:{m2 and (c or cm)}{m2 or '----':>5} {unit}{co}"
+                            )
+                        if m1 := cm and mqtt.get(f"device_{i}_pv_1_power", ""):
+                            m2 = cm and mqtt.get(f"device_{i}_pv_2_power", "")
+                            CONSOLE.info(
+                                f"{'Dev ' + str(i) + ' PV 1':<{col1}}:{m1 and (c or cm)}{m1 or '----':>5} {unit:<{col2 - 5}}{co} "
+                                f"{'Dev ' + str(i) + ' PV 2':<{col3}}:{m2 and (c or cm)}{m2 or '----':>5} {unit}{co}"
+                            )
+                        if m1 := cm and mqtt.get(f"device_{i}_pv_3_power", ""):
+                            m2 = cm and mqtt.get(f"device_{i}_pv_4_power", "")
+                            CONSOLE.info(
+                                f"{'Dev ' + str(i) + ' PV 3':<{col1}}:{m1 and (c or cm)}{m1 or '----':>5} {unit:<{col2 - 5}}{co} "
+                                f"{'Dev ' + str(i) + ' PV 4':<{col3}}:{m2 and (c or cm)}{m2 or '----':>5} {unit}{co}"
+                            )
+                    else:
+                        break
+                m1 = cm and mqtt.get("home_demand_circuit_total", "")
+                m2 = cm and mqtt.get("home_demand_other", "")
+                if m1 or m2:
+                    CONSOLE.info(
+                        f"{'Circuit Total':<{col1}}: {m1 and (c or cm)}{m1 or '----':>4} {unit:<{col2 - 5}}{co} "
+                        f"{'Home Other Load':<{col3}}: {m2 and (c or cm)}{m2 or '----':>4} {unit}{co}"
+                    )
+                for i in range(1, 13, 2):
+                    m1 = cm and mqtt.get(f"home_demand_circuit_{i:02d}", "")
+                    m2 = cm and mqtt.get(f"home_demand_circuit_{i + 1:02d}", "")
+                    if m1 or m2:
+                        m3 = cm and str(mqtt.get(f"id_circuit_{i:02d}", ""))
+                        m4 = cm and str(mqtt.get(f"id_circuit_{i + 1:02d}", ""))
+                        m5 = mqtt.get(f"peers_circuit_{i:02d}", [])
+                        m6 = mqtt.get(f"peers_circuit_{i + 1:02d}", [])
+                        CONSOLE.info(
+                            f"{'Pwr Circ. ' + '-'.join(map(str, [i, *m5])):<{col1}}: {m1 and (c or cm)}{m1 or '----':>4} {unit} (ID: {(m3 or '--') + ')':<{col2 - 12}}{co} "
+                            f"{'Pwr Circ. ' + '-'.join(map(str, [i + 1, *m6])):<{col3}}: {m2 and (c or cm)}{m2 or '----':>4} {unit} (ID: {(m4 or '--')}){co}"
+                        )
+                    else:
+                        break
+                if aiems := (dev.get("schedule") or {}).get("ai_ems") or {}:
+                    status = aiems.get("status")
+                    CONSOLE.info(
+                        f"{'AI Status':<{col1}}: {str(get_enum_name(SolarbankAiemsStatus, status, '-----')).capitalize() + ' (' + str(status) + ')':<{col2}} "
+                        f"{'AI Enabled':<{col3}}: {'YES' if aiems.get('enable') else 'NO'}"
+                    )
+                site_preset = dev.get("set_system_output_power", "")
+                if "schedule" in dev or site_preset:
+                    CONSOLE.info("." * 80)
+                    CONSOLE.info(
+                        f"{'Schedule  (Now)':<{col1}}: {datetime.now().astimezone().strftime('%H:%M:%S UTC %z'):<{col2}} "
+                        f"{'System Preset':<{col3}}: {str(site_preset).replace('W', '') or '---':>4} W"
+                    )
+                    if admin:
+                        # print schedule
+                        common.print_schedule(dev.get("schedule") or {})
+
+            elif devtype in [
+                SolixDeviceType.SOLARBANK.value,
+                SolixDeviceType.HOME_BACKUP.value,
+            ]:
+                unit = dev.get("power_unit", "W")
+                CONSOLE.info(
+                    f"{'Cloud Status':<{col1}}: {str(dev.get('status_desc', '-------')).capitalize():<{col2}} "
+                    f"{'Status Code':<{col3}}: {dev.get('status', '-')!s}"
+                )
+                m2 = (c or cm) and str(mqtt.get("charging_status", ""))
+                CONSOLE.info(
+                    f"{'Charge Status':<{col1}}: {m2 and (c or cm)}{(get_enum_name(SolixPpsPortStatus, m2, m2).replace('_', '').title() if devtype == SolixDeviceType.HOME_BACKUP.value else m2) or str(dev.get('charging_status_desc', '-------')).capitalize():<{col2}}{co} "
+                    f"{'Status Code':<{col3}}: {m2 and (c or cm)}{m2 or dev.get('charging_status', '-')!s}{co}"
+                )
+                m1 = cm and mqtt.get("battery_soc", "")
+                m2 = (
+                    (c or cm)
+                    and (
+                        mqtt.get("output_cutoff_data", "")
+                        or mqtt.get("power_cutoff", "")
+                    )
+                ) or (
+                    dev.get("discharge_lower_limit", "")
+                    or dev.get("power_cutoff", "")
+                    or dev.get("output_cutoff_data", "")
+                )
+                if m3 := cm and mqtt.get("battery_soh", ""):
+                    m3 = f"{float(m3):6.2f}"
+                soc = f"{str(m1) or dev.get('battery_soc', '---'):>4} %"
+                if (
+                    dev.get("generation", 0) > 1
+                    or devtype == SolixDeviceType.HOME_BACKUP.value
+                ):
+                    m4 = (c or cm) and (
+                        mqtt.get("max_soc", "") or dev.get("charge_upper_limit", "")
+                    )
+                    CONSOLE.info(
+                        f"{'Battery SoC/SoH':<{col1}}: {str(m1) and (c or cm)}{soc} /{m3 and (c or cm)}{m3 or ' --.--':>4} {'%':<{col2 - 15}}{co} "
+                        f"{'Min / Max SoC':<{col3}}: {str(m2) and (c or cm)}{(str(m2) or '--')!s:>4} %{co} / "
+                        f"{str(m4) and (c or cm)}{(str(m4) or '--')!s:>3} %{co}"
+                    )
+                    m1 = (c or cm) and str(
+                        mqtt.get("backup_soc", "") or dev.get("backup_reserve", "")
+                    )
+                    m3 = (c or cm) and (
+                        mqtt.get("backup_soc_switch", "")
+                        or dev.get("backup_reserve_switch", "")
+                    )
+                    m2 = (c or cm) and str(mqtt.get("active_discharge_soc", ""))
+                    m4 = (c or cm) and str(mqtt.get("active_charge_soc", ""))
+                    if m1 or m2 or m3 or m4:
+                        CONSOLE.info(
+                            f"{'Backup SoC/Sw.':<{col1}}: {m1 and (c or cm)}{(m1 or '--')!s:>4} %  "
+                            f"({str(m3) and c}{get_enum_name(SolixSwitchMode, m3, str(m3) or '---').upper():>3}{')':<{col2 - 12}}{co} "
+                            f"{'Act SoC Min/Max':<{col3}}: {m2 and (c or cm)}{(m2 or '--')!s:>4} %{co} / {m4 and (c or cm)}{(m4 or '--')!s:>3} %{co}"
+                        )
+                else:
+                    m4 = cm and mqtt.get("temperature", "")
+                    if m4 and mqtt.get("temp_unit_fahrenheit"):
+                        m4 = f"{float(m4) * 9 / 5 + 32:>4} °F"
+                    else:
+                        m4 = f"{m4 or '---':>4} {'°F' if mqtt.get('temp_unit_fahrenheit') else '°C'}"
+                    CONSOLE.info(
+                        f"{'Battery SoC/SoH':<{col1}}: {m1 and c}{soc} /{m3 and (c or cm)}{m3 or ' --.--':>4} {'%':<{col2 - 15}}{co} "
+                        f"{'Min SoC / Temp':<{col3}}: {m2 and (c or cm)}{m2 or (dev.get('power_cutoff') or dev.get('output_cutoff_data') or '--')!s:>4} %{co} "
+                        f"/ {m4 and (c or cm)}{m4}{co}"
+                    )
+                energy = f"{dev.get('battery_energy', '----'):>5} Wh"
+                if "battery_capacity" in dev:
+                    CONSOLE.info(
+                        f"{'Battery Energy':<{col1}}: {cc}{energy:<{col2}}{co} "
+                        f"{'Capacity':<{col3}}: {cc}{customized.get('battery_capacity') or dev.get('battery_capacity', '----')!s:>5} Wh{co}"
+                    )
+                unit = dev.get("power_unit", "W")
+                if (
+                    dev.get("generation", 0) > 1
+                    or devtype != SolixDeviceType.SOLARBANK.value
+                ):
+                    m1 = cm and str(mqtt.get("expansion_packs", ""))
+                    CONSOLE.info(
+                        f"{'Exp. Batteries':<{col1}}: {m1 and (c or cm)}{m1 or dev.get('sub_package_num', '-'):>4} {'Pcs':<{col2 - 5}}{co} "
+                        f"{'AC Socket Pwr':<{col3}}: {dev.get('ac_power', '---'):>4} {unit}"
+                    )
+                m1 = cm and mqtt.get("light_off_switch", "")
+                m2 = cm and mqtt.get("ac_socket_switch", "")
+                m3 = cm and str(mqtt.get("light_mode", ""))
+                if str(m1) or str(m2) or m3:
+                    mode = str(
+                        get_enum_name(SolarbankLightMode, m3, "unknown")
+                    ).capitalize()
+                    CONSOLE.info(
+                        f"{'Light':<{col1}}: {str(m1) and (c or cm)}{get_enum_name(SolixSwitchMode, not m1, str(not m1) or '---').upper():>3} "
+                        f"{'(Mode: ' + mode + ')':<{col2 - 4}}{co} "
+                        f"{'AC Socket Sw.':<{col3}}: {str(m2) and (c or cm)}{get_enum_name(SolixSwitchMode, m2, str(m2) or '---').upper():>3}{co}"
+                    )
+                m1 = cm and mqtt.get("device_sn", "")
+                m2 = cm and mqtt.get("main_battery_soc", "")
+                if m1 or m2:
+                    m3 = cm and mqtt.get("temperature", "")
+                    if m3 and mqtt.get("temp_unit_fahrenheit"):
+                        tmp = f"{float(m3) * 9 / 5 + 32:>4} °F"
+                    else:
+                        tmp = f"{m3 or '---':>4} {'°F' if mqtt.get('temp_unit_fahrenheit') else '°C'}"
+                    CONSOLE.info(
+                        f"{'Main Bat SN':<{col1}}: {m1 and (c or cm)}{m1:<{col2}}{co} "
+                        f"{'Main SoC/Temp':<{col3}}: {m2 and (c or cm)}{m2 or '---':>4} %{co} / {m3 and (c or cm)}{tmp}{co}"
+                    )
+                for i in range(1, 6):
+                    m1 = cm and mqtt.get(f"exp_{i}_sn", "")
+                    m2 = cm and mqtt.get(f"exp_{i}_soc", "")
+                    if m1 or m2:
+                        m3 = cm and mqtt.get(f"exp_{i}_temperature", "")
+                        if m3 and mqtt.get("temp_unit_fahrenheit"):
+                            tmp = f"{float(m3) * 9 / 5 + 32:>4} °F"
+                        else:
+                            tmp = f"{m3 or '---':>4} {'°F' if mqtt.get('temp_unit_fahrenheit') else '°C'}"
+                        CONSOLE.info(
+                            f"{'Exp. ' + str(i) + ' SN':<{col1}}: {m1 and (c or cm)}{m1:<{col2}}{co} "
+                            f"{'Exp. ' + str(i) + ' SoC/Temp':<{col3}}: {m2 and (c or cm)}{m2 or '---':>4} %{co} / {m3 and (c or cm)}{tmp}{co}"
+                        )
+                    else:
+                        break
+                # Solarbank power limits
+                if "power_limit" in dev or "all_power_limit" in dev:
+                    m1 = c and mqtt.get("max_load", "")
+                    m3 = c and mqtt.get("max_load_total", "")
+                    m2 = c and mqtt.get("ac_input_limit", "")
+                    allpwr = m3 or dev.get("all_power_limit", "")
+                    CONSOLE.info(
+                        f"{'Power Limit':<{col1}}: {m1 and c}{m1 or dev.get('power_limit') or '----':>4} {m3 and c}{('(All ' + allpwr + ' ' + unit + ')') if allpwr else '':<{col2 - 5}}{co} "
+                        f"{'AC Input Limit':<{col3}}: {m2 and c}{m2 or dev.get('ac_input_limit') or '----':>4} W{co}"
+                    )
+                    if isinstance(opt := dev.get("power_limit_option"), list):
+                        opt = [
+                            item
+                            for d in opt
+                            if isinstance(d, dict)
+                            for key, item in d.items()
+                            if key == "limit"
+                        ]
+                    CONSOLE.info(
+                        f"{'Pwr Limit Opt':<{col1}}: {str(opt or '------').replace(' ', ''):<{col2}}{co} "
+                        f"{'Limit Opt Real':<{col3}}: {(dev.get('power_limit_option_real') or '------')!s}"
+                    )
+                if "pv_power_limit" in dev:
+                    m1 = c and mqtt.get("pv_limit", "")
+                    m2 = c and get_enum_name(
+                        SolixSwitchMode,
+                        {0: 1, 1: 0}.get(mqtt.get("grid_export_disabled", "")),
+                        "",
+                    )
+                    feat1 = dev.get("allow_grid_export")
+                    feat2 = dev.get("grid_export_limit") or "----"
+                    CONSOLE.info(
+                        f"{'Solar Limit':<{col1}}: {m1 and c}{m1 or dev.get('pv_power_limit') or '----':>4} {unit:<{col2 - 5}}{co} "
+                        f"{'Grid export':<{col3}}: {m2 and c}{str(m2).upper() or ('ON' if feat1 else '---' if feat1 is None else 'OFF'):>4}{co} (Limit {feat2} W)"
+                    )
+                m1 = c and mqtt.get("photovoltaic_power", "")
+                m2 = c and mqtt.get("output_power", "")
+                m3 = cm and mqtt.get("pv_yield", "")
+                m4 = cm and mqtt.get("output_energy", "")
+                CONSOLE.info(
+                    f"{'Solar Power':<{col1}}: {m1 and c}{m1 or dev.get('input_power') or '---':>4} {unit}{m3 and (c or cm)}{((' (' + m3 + ' kWh)') if m3 else ''):<{col2 - 6}}{co} "
+                    f"{'Output Power':<{col3}}: {m2 and c}{m2 or dev.get('output_power') or dev.get('to_home_load') or '---'!s:>4} {unit}{m4 and (c or cm)}{((' (' + m4 + ' kWh)') if m4 else '')}{co}"
+                )
+                # show PV and battery voltage if available
+                m1 = cm and mqtt.get("pv_voltage", "")
+                m3 = cm and mqtt.get("battery_voltage", "")
+                if m1 or m3:
+                    m2 = cm and mqtt.get("output_voltage", "")
+                    CONSOLE.info(
+                        f"{'Voltage In/Out':<{col1}}: {m1 and (c or cm)}{m1 or '-.---':>6} V / {m2 or '-.---':>6} {'V':<{col2 - 18}}{co} "
+                        f"{'Voltage Battery':<{col3}}: {m3 and (c or cm)}{m3 or '-.---':>6} V{co}"
+                    )
+                # show each MPPT for Solarbank 2+
+                names = dev.get("pv_name") or {}
+                if "solar_power_1" in dev:
+                    name1 = names.get("pv1_name") or ""
+                    name2 = names.get("pv2_name") or ""
+                    m1 = c and mqtt.get("pv_1_power", "")
+                    m2 = c and mqtt.get("pv_2_power", "")
+                    CONSOLE.info(
+                        f"{'Solar Ch_1':<{col1}}: {m1 and c}{m1 or dev.get('solar_power_1') or '---':>4} {unit}{co}{(' (' + name1 + ')' if name1 else ''):<{col2 - 6}} "
+                        f"{'Solar Ch_2':<{col3}}: {m2 and c}{m2 or dev.get('solar_power_2') or '---':>4} {unit}{co}{(' (' + name2 + ')' if name2 else '')}"
+                    )
+                    if "solar_power_3" in dev:
+                        name1 = names.get("pv3_name") or ""
+                        name2 = names.get("pv4_name") or ""
+                        m1 = c and mqtt.get("pv_3_power", "")
+                        m2 = c and mqtt.get("pv_4_power", "")
+                        CONSOLE.info(
+                            f"{'Solar Ch_3':<{col1}}: {m1 and c}{m1 or dev.get('solar_power_3') or '---':>4} {unit}{co}{(' (' + name1 + ')' if name1 else ''):<{col2 - 6}} "
+                            f"{'Solar Ch_4':<{col3}}: {m2 and c}{m2 or dev.get('solar_power_4') or '---':>4} {unit}{co}{(' (' + name2 + ')' if name2 else '')}"
+                        )
+                m2 = c and mqtt.get("heating_power", "")
+                m4 = cm and mqtt.get("consumed_energy", "")
+                if m2 or "micro_inverter_power" in dev or "pei_heating_power" in dev:
+                    name1 = names.get("micro_inverter_name") or ""
+                    CONSOLE.info(
+                        f"{'Inverter Power':<{col1}}: {dev.get('micro_inverter_power') or '---':>4} {unit + (' (' + name1 + ')' if name1 else ''):<{col2 - 5}} "
+                        f"{'Heating Power':<{col3}}: {m2 and c}{m2 or dev.get('pei_heating_power') or '---':>4} {unit}{m4 and (c or cm)}{((' (' + m4 + ' kWh)') if m4 else '')}{co}"
+                    )
+                if "micro_inverter_power_limit" in dev:
+                    CONSOLE.info(
+                        f"{'Inverter Limit':<{col1}}: {dev.get('micro_inverter_power_limit') or '---':>4} {unit:<{col2 - 5}} "
+                        f"{'Low Limit':<{col3}}: {dev.get('micro_inverter_low_power_limit') or '---':>4} {unit}"
+                    )
+                if "grid_to_battery_power" in dev:
+                    m1 = c and mqtt.get("grid_to_battery_power", "")
+                    CONSOLE.info(
+                        f"{'Grid to Battery':<{col1}}: {m1 and c}{m1 or dev.get('grid_to_battery_power') or '---':>4} {unit:<{col2 - 5}}{co} "
+                        f"{'AC Input Power':<{col3}}: {dev.get('other_input_power') or '---':>4} {unit}{co}"
+                    )
+                m1 = c and mqtt.get("bat_charge_power", "")
+                m2 = c and mqtt.get("bat_discharge_power", "")
+                m3 = cm and mqtt.get("charged_energy", "")
+                m4 = cm and mqtt.get("discharged_energy", "")
+                CONSOLE.info(
+                    f"{'Battery Charge':<{col1}}: {m1 and (c or cm)}{m1 or dev.get('bat_charge_power') or '---':>4} {unit}{m3 and (c or cm)}{(' (' + m3 + ' kWh)') if m3 else '':<{col2 - 6}}{co} "
+                    f"{'Battery Dischrg':<{col3}}: {m2 and (c or cm)}{m2 or dev.get('bat_discharge_power') or '---':>4} {unit}{m4 and (c or cm)}{(' (' + m4 + ' kWh)') if m4 else ''}{co}"
+                )
+                if m1 := cm and mqtt.get("device_efficiency", ""):
+                    m1 = f"{float(m1):6.2f}"
+                if m2 := cm and mqtt.get("battery_efficiency", ""):
+                    m2 = f"{float(m2):6.2f}"
+                if m1 or m2:
+                    CONSOLE.info(
+                        f"{'System Eff.':<{col1}}: {cc}{m1 or '  --.--':>7} {'%':<{col2 - 8}}{co} "
+                        f"{'Battery Eff.':<{col3}}: {cc}{m2 or '  --.--':>7} %{co}"
+                    )
+                preset = dev.get("set_output_power") or "---"
+                m1 = c and mqtt.get("battery_power_signed", "")
+                m2 = c and mqtt.get("home_load_preset", "")
+                CONSOLE.info(
+                    f"{'Battery Power':<{col1}}: {m1 and c}{m1 or dev.get('charging_power') or '---':>4} {unit:<{col2 - 5}}{co} "
+                    f"{'Device Preset':<{col3}}: {m2 and c}{m2 or preset:>4} {unit}{co}"
+                )
+                demand = site.get("home_load_power") or ""
+                load = (site.get("solarbank_info") or {}).get("to_home_load") or ""
+                diff = ""
+                if m1 := c and str(mqtt.get("home_demand", "")):
+                    demand = m1
+                if m2 := c and str(
+                    mqtt.get("ac_output_power_signed", "")
+                    or mqtt.get("ac_output_power", "")
+                ):
+                    load = m2
+                if demand or load:
+                    #with contextlib.suppress(ValueError):
+                    #    if float(demand) > float(load):
+                    #        diff = "(-)"
+                    #    elif float(demand) < float(load):
+                    #        diff = "(+)"
+                    CONSOLE.info(
+                        f"{'Home Demand':<{col1}}: {str(m1) and c}{demand or '---':>4} {unit:<{col2 - 5}}{co} "
+                        #f"{'SB Home Load':<{col3}}: {str(m2) and c}{load or '---':>4} {unit}{co}  {diff}"
+                    )
+                # Total smart plug power and other power?
+                if site.get("smart_plug_info"):
+                    CONSOLE.info(
+                        f"{'Smart Plugs':<{col1}}: {(site.get('smart_plug_info') or {}).get('total_power') or '---':>4} {unit:<{col2 - 5}} "
+                        f"{'Other (Plan)':<{col3}}: {site.get('other_loads_power') or '---':>4} {unit}"
+                    )
+                if m1 := cm and str(mqtt.get("device_timeout_minutes", "")):
+                    m2 = cm and str(mqtt.get("max_load_legal", ""))
+                    CONSOLE.info(
+                        f"{'Device Timeout':<{col1}}: {m1 and (c or cm)}{m1 + ' Minutes':<{col2}}{co} "
+                        f"{'Max load legal':<{col3}}: {m2 and (c or cm)}{m2 or '----':>4} W{co}"
+                    )
+                # print schedule if Solarbank and not station managed
+                if (
+                    not dev.get("station_sn")
+                    and devtype == SolixDeviceType.SOLARBANK.value
+                ):
+                    CONSOLE.info("." * 80)
+                    if (
+                        aiems := (dev.get("schedule") or {}).get("ai_ems") or {}
+                    ) and not dev.get("station_sn"):
+                        status = aiems.get("status")
+                        CONSOLE.info(
+                            f"{'AI Status':<{col1}}: {str(get_enum_name(SolarbankAiemsStatus, status, '-----')).capitalize() + ' (' + str(status) + ')':<{col2}} "
+                            f"{'AI Enabled':<{col3}}: {'YES' if aiems.get('enable') else 'NO'}"
+                        )
+                    site_preset = dev.get("set_system_output_power") or "---"
+                    CONSOLE.info(
+                        f"{'Schedule  (Now)':<{col1}}: {datetime.now().astimezone().strftime('%H:%M:%S UTC %z'):<{col2}} "
+                        f"{'System Preset':<{col3}}: {str(site_preset).replace('W', ''):>4} W"
+                    )
+                    if admin:
+                        common.print_schedule(dev.get("schedule") or {})
+
+            elif devtype == SolixDeviceType.INVERTER.value:
+                CONSOLE.info(
+                    f"{'Cloud Status':<{col1}}: {str(dev.get('status_desc', '-------')).capitalize():<{col2}} "
+                    f"{'Status Code':<{col3}}: {dev.get('status', '-')!s}"
+                )
+                unit = dev.get("power_unit", "W")
+                CONSOLE.info(
+                    f"{'AC Power':<{col1}}: {dev.get('generate_power', '----'):>4} {unit:<{col2 - 5}} "
+                    f"{'Inverter Limit':<{col3}}: {dev.get('preset_inverter_limit', '---'):>4} {unit}"
+                )
+
+            elif devtype == SolixDeviceType.SMARTMETER.value:
+                CONSOLE.info(
+                    f"{'Cloud Status':<{col1}}: {str(dev.get('status_desc', '-------')).capitalize():<{col2}} "
+                    f"{'Status Code':<{col3}}: {dev.get('status', '-')!s}"
+                )
+                CONSOLE.info(
+                    f"{'Grid Status':<{col1}}: {str(dev.get('grid_status_desc', '-------')).capitalize():<{col2}} "
+                    f"{'Status Code':<{col3}}: {dev.get('grid_status', '-')!s}"
+                )
+                unit = "W"
+                m1 = cm and mqtt.get("grid_to_home_power", "")
+                m2 = cm and mqtt.get("pv_to_grid_power", "")
+                m3 = cm and mqtt.get("grid_import_energy", "")
+                m4 = cm and mqtt.get("grid_export_energy", "")
+                CONSOLE.info(
+                    f"{'Grid Import':<{col1}}: {m1 and (c or cm)}{m1 or dev.get('grid_to_home_power') or '----':>4} {unit}{m3 and (c or cm)}{(' (' + m3 + ' kWh)' if m3 else ''):<{col2 - 6}}{co} "
+                    f"{'Grid Export':<{col3}}: {m2 and (c or cm)}{m2 or dev.get('photovoltaic_to_grid_power') or '----':>4} {unit}{m4 and (c or cm)}{(' (' + m4 + ' kWh)' if m4 else '')}{co}"
+                )
+                m1 = cm and mqtt.get("grid_power_signed_l1", "")
+                if (m2 := cm and mqtt.get("voltage_l1", "")) and "." in m2:
+                    m2 = f"{float(m2):>6.2f}"
+                if (m4 := cm and mqtt.get("current_l1", "")) and "." in m4:
+                    m4 = f"{float(m4):>6.3f}"
+                if m1 or m2 or m4:
+                    CONSOLE.info(
+                        f"{'Grid Power L1':<{col1}}: {m1 and (c or (c or cm))}{m1 or '-----':>5} {unit:<{col2 - 6}}{co} "
+                        f"{'Volt/Current L1':<{col3}}: {m2 and (c or cm)}{m2 or '---.--':>7} V /{m4 and (c or cm)}{(m4 or '-.---') + ' A'}{co}"
+                    )
+                m1 = cm and mqtt.get("grid_power_signed_l2", "")
+                if (m2 := cm and mqtt.get("voltage_l2", "")) and "." in m2:
+                    m2 = f"{float(m2):>6.2f}"
+                if (m4 := cm and mqtt.get("current_l2", "")) and "." in m4:
+                    m4 = f"{float(m4):>6.3f}"
+                if m1 or m2 or m4:
+                    CONSOLE.info(
+                        f"{'Grid Power L2':<{col1}}: {m1 and (c or (c or cm))}{m1 or '-----':>5} {unit:<{col2 - 6}}{co} "
+                        f"{'Volt/Current L2':<{col3}}: {m2 and (c or cm)}{m2 or '---.--':>7} V /{m4 and (c or cm)}{(m4 or '-.---') + ' A'}{co}"
+                    )
+                m1 = cm and mqtt.get("grid_power_signed_l3", "")
+                if (m2 := cm and mqtt.get("voltage_l3", "")) and "." in m2:
+                    m2 = f"{float(m2):>6.2f}"
+                if (m4 := cm and mqtt.get("current_l3", "")) and "." in m4:
+                    m4 = f"{float(m4):>6.3f}"
+                if m1 or m2 or m4:
+                    CONSOLE.info(
+                        f"{'Grid Power L3':<{col1}}: {m1 and (c or (c or cm))}{m1 or '-----':>5} {unit:<{col2 - 6}}{co} "
+                        f"{'Volt/Current L3':<{col3}}: {m2 and (c or cm)}{m2 or '---.--':>7} V /{m4 and (c or cm)}{(m4 or '-.---') + ' A'}{co}"
+                    )
+                m1 = cm and mqtt.get("power_factor", "")
+                if (m2 := cm and mqtt.get("voltage_l1l2", "")) and "." in m2:
+                    m2 = f"{float(m2):>6.2f}"
+                if m1 or m2:
+                    CONSOLE.info(
+                        f"{'Power Factor':<{col1}}: {m1 and (c or cm)}{m1 or '-.---':>7} {'':<{col2 - 8}}{co} "
+                        f"{'Voltage L1-L2':<{col3}}: {m2 and (c or cm)}{m2 or '---.--':>7} V{co}"
+                    )
+                if (m1 := cm and mqtt.get("voltage_l2L3", "")) and "." in m1:
+                    m1 = f"{float(m1):>6.2f}"
+                if (m2 := cm and mqtt.get("voltage_l2L3", "")) and "." in m2:
+                    m2 = f"{float(m2):>6.2f}"
+                if m1 or m2:
+                    CONSOLE.info(
+                        f"{'Voltage L1-L3':<{col1}}: {m1 and (c or cm)}{m1 or '---.--':>7} {'V':<{col2 - 8}}{co} "
+                        f"{'Voltage L3-L3':<{col3}}: {m2 and (c or cm)}{m2 or '---.--':>7} V{co}"
+                    )
+                m1 = cm and mqtt.get("system_output_power_signed_l1", "")
+                if (
+                    m2 := cm and mqtt.get("system_output_current_l1", "")
+                ) and "." in m2:
+                    m2 = f"{float(m2):>6.3f}"
+                if m1 or m2:
+                    CONSOLE.info(
+                        f"{'Sys Out Pwr L1':<{col1}}: {m1 and (c or (c or cm))}{m1 or '-----':>5} {unit:<{col2 - 6}}{co} "
+                        f"{'Sys Current L1':<{col3}}: {m2 and (c or cm)}{m2 or '--.---':>7} A{co}"
+                    )
+                m1 = cm and mqtt.get("system_output_power_signed_l2", "")
+                if (
+                    m2 := cm and mqtt.get("system_output_current_l2", "")
+                ) and "." in m2:
+                    m2 = f"{float(m2):>6.3f}"
+                if m1 or m2:
+                    CONSOLE.info(
+                        f"{'Sys Out Pwr L2':<{col1}}: {m1 and (c or (c or cm))}{m1 or '-----':>5} {unit:<{col2 - 6}}{co} "
+                        f"{'Sys Current L2':<{col3}}: {m2 and (c or cm)}{m2 or '--.---':>7} A{co}"
+                    )
+                m1 = cm and mqtt.get("system_output_power_signed_l3", "")
+                if (
+                    m2 := cm and mqtt.get("system_output_current_l3", "")
+                ) and "." in m2:
+                    m2 = f"{float(m2):>6.3f}"
+                if m1 or m2:
+                    CONSOLE.info(
+                        f"{'Sys Out Pwr L3':<{col1}}: {m1 and (c or (c or cm))}{m1 or '-----':>5} {unit:<{col2 - 6}}{co} "
+                        f"{'Sys Current L3':<{col3}}: {m2 and (c or cm)}{m2 or '--.---':>7} A{co}"
+                    )
+            elif devtype == SolixDeviceType.SMARTPLUG.value:
+                CONSOLE.info(
+                    f"{'Cloud Status':<{col1}}: {str(dev.get('status_desc', '-------')).capitalize():<{col2}} "
+                    f"{'Status Code':<{col3}}: {dev.get('status', '-')!s}"
+                )
+                CONSOLE.info(
+                    f"{'Device Error':<{col1}}: {'YES' if dev.get('err_code') else ' NO':<{col2}} "
+                    f"{'Error Code':<{col3}}: {dev.get('err_code', '---')!s}"
+                )
+                feat1 = dev.get("auto_switch")
+                feat2 = dev.get("priority")
+                CONSOLE.info(
+                    f"{'AI switched':<{col1}}: {'YES' if feat1 else '---' if feat1 is None else ' NO':>3} {'(Prio: ' + ('-' if feat2 is None else str(feat2)) + ')':<{col2 - 4}} "
+                    f"{'Runtime':<{col3}}: {json.dumps(dev.get('running_time')).replace('null', '-------'):>3}"
+                )
+                unit = dev.get("power_unit", "W")
+                if m1 := c and mqtt.get("power", ""):
+                    m1 = f"{float(m1):.0f}"
+                CONSOLE.info(
+                    f"{'Plug Power':<{col1}}: {m1 and c}{m1 or dev.get('current_power', ''):>4} {unit:<{col2 - 5}}{co} "
+                    f"{'Tag':<{col3}}: {dev.get('tag', '')}"
+                )
+                if (m1 := cm and mqtt.get("voltage", "")) and "." in m1:
+                    m1 = f"{float(m1):>6.2f}"
+                if (m2 := cm and mqtt.get("current", "")) and "." in m2:
+                    m2 = f"{float(m2):>6.3f}"
+                if m1 or m2:
+                    CONSOLE.info(
+                        f"{'Voltage':<{col1}}: {m1 and (c or cm)}{m1 or '---.--':>7} {'V':<{col2 - 8}}{co} "
+                        f"{'Current':<{col3}}: {m2 and (c or cm)}{m2 or '-.---':>7} A{co}"
+                    )
+                if dev.get("energy_today"):
+                    CONSOLE.info(
+                        f"{'Energy Today':<{col1}}: {dev.get('energy_today') or '-.--':>4} {'kWh':<{col2 - 5}} "
+                        f"{'Last Period':<{col3}}: {dev.get('energy_last_period') or '-.--':>4} kWh"
+                    )
+                m1 = cm and mqtt.get("ac_output_power_switch", "")
+                m2 = cm and mqtt.get("output_energy", "")
+                if str(m1) or m2:
+                    CONSOLE.info(
+                        f"{'Plug Switch':<{col1}}: {str(m1) and (c or cm)}{get_enum_name(SolixSwitchMode, m1, str(m1) or '---').upper():>3}{'':<{col2 - 3}}{co} "
+                        f"{'Output Energy':<{col3}}: {m2 and (c or cm)}{m2 or '-.---':>7} kWh{co}"
+                    )
+                m1 = cm and str(mqtt.get("toggle_timer_mode", ""))
+                m2 = cm and mqtt.get("toggle_to_switch", "")
+                if m1 or str(m2):
+                    CONSOLE.info(
+                        f"{'Sw. Timer Mode':<{col1}}: {m1 and (c or cm)}{get_enum_name(SolixPlugTimerMode, m1, 'unknown').capitalize() + ' (' + (m1 or '-') + ')':<{col2}}{co} "
+                        f"{'Toggle Sw. To':<{col3}}: {str(m2) and (c or cm)}{get_enum_name(SolixSwitchMode, m2, str(m2) or '---').upper():>3}{co}"
+                    )
+                m1 = cm and mqtt.get("toggle_to_delay_time", "")
+                m2 = cm and mqtt.get("toggle_to_elapsed_time", "")
+                if m1 or m2:
+                    CONSOLE.info(
+                        f"{'Toggle Timer':<{col1}}: {m1 and (c or cm)}{m1 or '--:--:--':>8} {'':<{col2 - 8}}{co}"
+                        f"{'Elapsed/Remain':<{col3}}: {m2 and (c or cm)}{m2 or '--:--:--':>8} "
+                        f"/ {(m1 and m2 and str(datetime.strptime(m1, '%H:%M:%S') - datetime.strptime(m2, '%H:%M:%S'))) or '--:--:--'}{co}"
+                    )
+
+            elif devtype in [
+                SolixDeviceType.POWERPANEL.value,
+                SolixDeviceType.HES.value,
+            ]:
+                if (main_sn := dev.get("main_sn")) and main_sn != sn:
+                    CONSOLE.info(
+                        f"{'Main SN':<{col1}}: {main_sn:<{col2}} "
+                        f"{'Main PN':<{col3}}: {dev.get('main_pn', '-----')!s}"
+                    )
+                if hes := dev.get("hes_data") or {}:
+                    CONSOLE.info(
+                        f"{'Station ID':<{col1}}: {hes.get('station_id', '-------'):<{col2}}     (Type: {str(hes.get('type', '---')).upper()})"
+                    )
+                    CONSOLE.info(
+                        f"{'Cloud Status':<{col1}}: {str(hes.get('status_desc', '-------')).capitalize() + ' (' + str(hes.get('online_status', '-')) + ')':<12}"
+                        f"{'':<{col2 - 12}}{co} "
+                        f"{'Network Status':<{col3}}: {str(hes.get('network_status_desc', '-------')).capitalize()} ({hes.get('network_status', '-')!s})"
+                    )
+                    CONSOLE.info(
+                        f"{'Grid Status':<{col1}}: {str(hes.get('grid_status_desc', '-------')).capitalize() + ' (' + str(hes.get('grid_status', '-')) + ')':<12}"
+                        f"{'':<{col2 - 12}}{co} "
+                        f"{'Role Status':<{col3}}: {str(hes.get('role_status_desc', '-------')).capitalize()} ({hes.get('master_slave_status', '-')!s})"
+                    )
+                if "status_desc" in dev:
+                    CONSOLE.info(
+                        f"{'Cloud Status':<{col1}}: {str(dev.get('status_desc', '-------')).capitalize():<{col2}} "
+                        f"{'Status Code':<{col3}}: {dev.get('status', '-')!s}"
+                    )
+                m1 = cm and mqtt.get("plant_status", "")
+                m2 = cm and mqtt.get("battery_status", "")
+                if str(m1) or str(m2):
+                    CONSOLE.info(
+                        f"{'Plant Status':<{col1}}: {str(m1) and (c or cm)}{get_enum_name(SolixPlantStatus, str(m1), 'unknown' if str(m1) else '-----').capitalize() + ' (' + (str(m1) or '-') + ')':<12}{'':<{col2 - 12}}{co} "
+                        f"{'Battery Status':<{col1}}: {str(m2) and (c or cm)}"
+                        f"{get_enum_name(SolixBatteryStatus, str(m2), 'unknown' if str(m2) else '-----').capitalize() + ' (' + (str(m2) or '-') + ')'}{co} "
+                    )
+                m1 = cm and mqtt.get("working_status", "")
+                m2 = cm and mqtt.get("mode", "")
+                if str(m1) or str(m2):
+                    CONSOLE.info(
+                        f"{'Work Status':<{col1}}: {str(m1) and (c or cm)}{get_enum_name(SolixWorkingStatus, str(m1), 'unknown' if str(m1) else '-----').capitalize() + ' (' + (str(m1) or '-') + ')':<12}{'':<{col2 - 12}}{co} "
+                        f"{'Mode':<{col1}}: {str(m2) and (c or cm)}"
+                        f"{get_enum_name(SolixMode, str(m2), 'unknown' if str(m2) else '-----').capitalize() + ' (' + (str(m2) or '-') + ')'}{co} "
+                    )
+                if m1 := cm and mqtt.get("last_update", ""):
+                    m2 = cm and mqtt.get("local_time", "")
+                    CONSOLE.info(
+                        f"{'MQTT Msg Time':<{col1}}: {m1 and (c or cm)}{m1:<{col2}}{co} "
+                        f"{'Local Time':<{col3}}: {m2 and (c or cm)}{m2}{co}"
+                    )
+                unit = "W"
+                avg = dev.get("average_power") or {}
+                if m1 := cm and mqtt.get("photovoltaic_power", ""):
+                    m2 = cm and mqtt.get("pv_to_home_power", "")
+                    m3 = cm and mqtt.get("pv_yield", "")
+                    CONSOLE.info(
+                        f"{'Solar Power':<{col1}}: {m1 and (c or cm)}{m1:>5} {unit}{m3 and (c or cm)}{((' (' + m3 + ' kWh)') if m3 else ''):<{col2 - 7}}{co} "
+                        f"{'PV -> Home Pwr':<{col3}}: {m2 and (c or cm)}{m2 or '-':>5} {unit}{co}"
+                    )
+                if m1 := cm and mqtt.get("pv_to_battery_power", ""):
+                    m2 = cm and mqtt.get("pv_to_grid_power", "")
+                    CONSOLE.info(
+                        f"{'PV -> Batt Pwr':<{col1}}: {m1 and (c or cm)}{m1:>5} {unit:<{col2 - 6}}{co} "
+                        f"{'PV -> Grid Pwr':<{col3}}: {m2 and (c or cm)}{m2 or '-':>5} {unit}{co}"
+                    )
+                if m1 := cm and mqtt.get("battery_power_signed", ""):
+                    m2 = cm and mqtt.get("battery_to_home_power", "")
+                    CONSOLE.info(
+                        f"{'Battery Power':<{col1}}: {m1 and (c or cm)}{m1:>5} {unit:<{col2 - 6}}{co} "
+                        f"{'Bat -> Home Pwr':<{col3}}: {m2 and (c or cm)}{m2 or '-':>5} {unit}{co}"
+                    )
+                if m1 := cm and mqtt.get("grid_to_battery_power", ""):
+                    m2 = cm and mqtt.get("battery_to_grid_power", "")
+                    CONSOLE.info(
+                        f"{'Grid -> Bat Pwr':<{col1}}: {m1 and (c or cm)}{m1:>5} {unit:<{col2 - 6}}{co} "
+                        f"{'Bat -> Grid Pwr':<{col3}}: {m2 and (c or cm)}{m2 or '-':>5} {unit}{co}"
+                    )
+                if m1 := cm and mqtt.get("generator_power", ""):
+                    m2 = cm and mqtt.get("generator_plug_status", "")
+                    CONSOLE.info(
+                        f"{'Generator Power':<{col1}}:{m1 and (c or cm)}{m1 or '----':>5} {unit:<{col2 - 6}}{co} "
+                        f"{'Generator Plug':<{col3}}:{str(m2) and (c or cm)} {('Connected' if m2 == 1 else 'Disconnected' if m2 == 0 else 'Unknown')} ({'-' if m2 is None else str(m2)}){co}"
+                    )
+                if m1 := cm and mqtt.get("generator_to_home_power", ""):
+                    m2 = cm and mqtt.get("generator_to_battery_power", "")
+                    CONSOLE.info(
+                        f"{'Gen -> Home Pwr':<{col1}}: {m1 and (c or cm)}{m1:>5} {unit:<{col2 - 6}}{co} "
+                        f"{'Gen -> Bat Pwr':<{col3}}: {m2 and (c or cm)}{m2 or '-':>5} {unit}{co}"
+                    )
+                if m1 := cm and mqtt.get("grid_power_signed", ""):
+                    m2 = cm and mqtt.get("ac_output_power", "")
+                    CONSOLE.info(
+                        f"{'Grid Power':<{col1}}: {m1 and (c or cm)}{m1:>5} {unit:<{col2 - 6}}{co} "
+                        f"{'AC Home Pwr':<{col3}}: {m2 and (c or cm)}{m2 or '-':>5} {unit}{co}"
+                    )
+                if "battery_capacity" in dev:
+                    CONSOLE.info(
+                        f"{'Capacity':<{col1}}: {cc}{customized.get('battery_capacity') or dev.get('battery_capacity', '-----')!s:>5} {'Wh':<{col2 - 6}}{co} "
+                        f"{'Battery Count':<{col3}}: {dev.get('batCount') or '-'}"
+                    )
+                m1 = c and mqtt.get("battery_soc", "")
+                if m1 or avg:
+                    CONSOLE.info(
+                        f"{'Battery SoC':<{col1}}: {m1 and c}{m1 or avg.get('state_of_charge') or '---':>5} {'%':<{col2 - 6}}{co} "
+                        f"{'Battery Energy':<{col3}}: {cc}{dev.get('battery_energy', '-----'):>5} Wh{co}"
+                    )
+                if m1 := cm and mqtt.get("battery_voltage", ""):
+                    m1 = f"{float(m1):6.2f}"
+                if m2 := cm and mqtt.get("battery_soh", ""):
+                    m2 = f"{float(m2):6.2f}"
+                if m1 or m2:
+                    CONSOLE.info(
+                        f"{'Battery Volt':<{col1}}: {m1 and (c or cm)}{m1:>6} {'V':<{col2 - 7}}{co} "
+                        f"{'Battery SoH':<{col3}}: {m2 and (c or cm)}{m2 or '--.--':>6} %{co}"
+                    )
+                m1 = cm and mqtt.get("charged_energy", "")
+                m2 = cm and mqtt.get("discharged_energy", "")
+                if m3 := cm and mqtt.get("battery_efficiency", ""):
+                    m3 = f"{float(m3):6.2f}"
+                if m1 or m2:
+                    CONSOLE.info(
+                        f"{'Charged Energy':<{col1}}: {m1 and (c or cm)}{m1 or '----.---':>8} {'kWh':<{col2 - 9}}{co} "
+                        f"{'Dischrgd Energy':<{col3}}: {m2 and (c or cm)}{m2 or '----.---':>8} {'kWh'}  {m3 and cc}({m3 or '--.--'} %){co}"
+                    )
+                if avg:
+                    unit = str(avg.get("power_unit") or "").upper()
+                    CONSOLE.info(
+                        f"{'Valid ⌀ before':<{col1}}: {avg.get('valid_time', 'Unknown'):<{col2}} "
+                        f"{'Last Check':<{col3}}: {avg.get('last_check', 'Unknown')!s}"
+                    )
+                    CONSOLE.info(
+                        f"{'Solar Power ⌀':<{col1}}: {avg.get('solar_power_avg') or '-.--':>5} {unit:<{col2 - 6}} "
+                        f"{'Home Usage ⌀':<{col3}}: {avg.get('home_usage_avg') or '-.--':>5} {unit}"
+                    )
+                    CONSOLE.info(
+                        f"{'EV Charge Pwr ⌀':<{col1}}: {avg.get('ev_charge_power_avg') or '-.--':>5} {unit:<{col2 - 6}} "
+                    )
+                    CONSOLE.info(
+                        f"{'Charge Power ⌀':<{col1}}: {avg.get('charge_power_avg') or '-.--':>5} {unit:<{col2 - 6}} "
+                        f"{'Discharge Pwr ⌀':<{col3}}: {avg.get('discharge_power_avg') or '-.--':>5} {unit}"
+                    )
+                    CONSOLE.info(
+                        f"{'Grid Import ⌀':<{col1}}: {avg.get('grid_import_avg') or '-.--':>5} {unit:<{col2 - 6}} "
+                        f"{'Grid Export ⌀':<{col3}}: {avg.get('grid_export_avg') or '-.--':>5} {unit}"
+                    )
+            elif devtype == SolixDeviceType.EV_CHARGER.value:
+                CONSOLE.info(
+                    f"{'Cloud Status':<{col1}}: {str(dev.get('status_desc', '-------')).capitalize():<{col2}} "
+                    f"{'Status Code':<{col3}}: {dev.get('status', '-')!s}"
+                )
+                m1 = c and str(mqtt.get("ocpp_connect_status", ""))
+                m2 = cm and str(mqtt.get("cp_signal_status", ""))
+                code = (c and m1) or str(dev.get("ocpp_connect_status"))
+                desc = get_enum_name(
+                    SolixOcppConnectionStatus, code, "unknown" if code else "-------"
+                )
+                CONSOLE.info(
+                    f"{'OCPP Status':<{col1}}: {str(m1) and (c or cm)}{desc.capitalize() + ' (' + (code or '-') + ')':<15}{'':<{col2 - 15}}{co} "
+                    f"{'CP Sig. Status':<{col1}}: {str(m2) and (c or cm)}"
+                    f"{get_enum_name(SolixCpSignalStatus, m2, 'unknown' if m2 else '-------').capitalize() + ' (' + (m2 or '-') + ')'}{co} "
+                )
+                CONSOLE.info(
+                    f"{'Device Error':<{col1}}: {'YES' if dev.get('err_code') else ' NO':<{col2}} "
+                    f"{'Error Code':<{col3}}: {dev.get('err_code', '---')!s}"
+                )
+                CONSOLE.info(
+                    f"{'Group':<{col1}}: {(dev.get('group_info') or '-------')!s:<{col2}} "
+                    f"{'Access Group':<{col3}}: {integrated.get('access_group', '-------')!s}"
+                )
+                m1 = cm and str(mqtt.get("ev_charger_status", ""))
+                m2 = cm and mqtt.get("boost_status", "")
+                code = (c and m1) or str(dev.get("ev_charger_status", ""))
+                desc = get_enum_name(
+                    SolixEvChargerStatus, code, "unknown" if code else "-------"
+                )
+                CONSOLE.info(
+                    f"{'Charger Status':<{col1}}: {m1 and (c or cm)}{desc.capitalize() + ' (' + (code or '-') + ')':<{col2}}{co} "
+                    f"{'Boost Status':<{col3}}: {str(m2) and (c or cm)}{get_enum_name(SolixSwitchMode, m2, str(m2) or '---').upper()}{co} "
+                )
+                if str(m1 := cm and mqtt.get("charging_start_timestamp", "")):
+                    m1 = datetime.fromtimestamp(m1).strftime("%Y-%m-%d %H:%M:%S")
+                if str(
+                    m2 := cm and mqtt.get("charging_duration_seconds", "")
+                ).isdigit():
+                    m2 = timedelta(seconds=int(m2))
+                if m1 or str(m2):
+                    CONSOLE.info(
+                        f"{'Charge Started':<{col1}}: {m1 and (c or cm)}{m1 or '----.--.-- --:--:--':<{col2}}{co} "
+                        f"{'Charge Duration':<{col3}}: {m2 and (c or cm)}{(str(m2)) or '- D --:--:--'}{co} "
+                    )
+                m1 = cm and mdev.ev_charger_mode_state()
+                m2 = str(cm and mqtt.get("plug_status", ""))
+                m3 = str(cm and mqtt.get("start_countdown_seconds", ""))
+                m4 = str(cm and mqtt.get("plug_countdown_seconds", ""))
+                if m1 or m2:
+                    CONSOLE.info(
+                        f"{'Charging Mode':<{col1}}: {m1 and (c or cm)}{str(m1 or '-------').replace('_', ' ').capitalize() + ' (' + (m3 or '---') + ' Sec)':<{col2}}{co} "
+                        f"{'Plug Status':<{col3}}: {m2 and (c or cm)}{get_enum_name(SolixConnectionStatus, m2, m2 or '-------').capitalize()} ({m4 or '---'} Sec){co} "
+                    )
+                m1 = str(cm and mqtt.get("phase_operating_mode", ""))
+                if str(m2 := cm and mqtt.get("charging_window_seconds", "")).isdigit():
+                    m2 = timedelta(seconds=int(m2))
+                if m1 or m2:
+                    CONSOLE.info(
+                        f"{'Phase Op. Mode':<{col1}}: {m1 and (c or cm)}{get_enum_name(SolixPhaseMode, m1, m1 or '-------').replace('_', ' ').capitalize() + ' (' + (m1 or '-') + ')':<{col2}}{co} "
+                        f"{'Charge Window':<{col3}}: {m2 and (c or cm)}{str(m2) or '--:--:--'}{co}"
+                    )
+                m1 = (c and mqtt.get("bat_charge_power", "")) or dev.get(
+                    "bat_charge_power", ""
+                )
+                m2 = cm and mqtt.get("charging_energy", "")
+                if m1 or m2:
+                    CONSOLE.info(
+                        f"{'Charging Power':<{col1}}: {m1 and c}{m1 or '-----':>7} {'W':<{col2 - 8}}{co} "
+                        f"{'Charging Energy':<{col3}}: {m2 and (c or cm)}{m2 or '--.---':>8} kWh{co}"
+                    )
+                m1 = cm and mqtt.get("power_l1", "")
+                m2 = cm and mqtt.get("charging_energy_l1", "")
+                if m1 or m2:
+                    CONSOLE.info(
+                        f"{'Power L1':<{col1}}: {m1 and (c or cm)}{m1 or '-----':>7} {'W':<{col2 - 8}}{co} "
+                        f"{'Ch. Energy L1':<{col3}}: {m2 and (c or cm)}{m2 or '--.---':>8} kWh{co}"
+                    )
+                m1 = cm and mqtt.get("power_l2", "")
+                m2 = cm and mqtt.get("charging_energy_l2", "")
+                if m1 or m2:
+                    CONSOLE.info(
+                        f"{'Power L2':<{col1}}: {m1 and (c or cm)}{m1 or '-----':>7} {'W':<{col2 - 8}}{co} "
+                        f"{'Ch. Energy L2':<{col3}}: {m2 and (c or cm)}{m2 or '--.---':>8} kWh{co}"
+                    )
+                m1 = cm and mqtt.get("power_l3", "")
+                m2 = cm and mqtt.get("charging_energy_l3", "")
+                if m1 or m2:
+                    CONSOLE.info(
+                        f"{'Power L3':<{col1}}: {m1 and (c or cm)}{m1 or '-----':>7} {'W':<{col2 - 8}}{co} "
+                        f"{'Ch. Energy L3':<{col3}}: {m2 and (c or cm)}{m2 or '--.---':>8} kWh{co}"
+                    )
+                if (m1 := cm and mqtt.get("current_l1", "")) and "." in m1:
+                    m1 = f"{float(m1):>6.3f}"
+                if (m2 := cm and mqtt.get("voltage_l1", "")) and "." in m2:
+                    m2 = f"{float(m2):>6.2f}"
+                if m1 or m2:
+                    CONSOLE.info(
+                        f"{'Current L1':<{col1}}: {m1 and (c or (c or cm))}{m1 or '---.---':>7} {'A':<{col2 - 8}}{co} "
+                        f"{'Voltage L1':<{col3}}: {m2 and (c or (c or cm))}{m2 or '----.--':>7} V{co}"
+                    )
+                if (m1 := cm and mqtt.get("current_l2", "")) and "." in m1:
+                    m1 = f"{float(m1):>6.3f}"
+                if (m2 := cm and mqtt.get("voltage_l2", "")) and "." in m2:
+                    m2 = f"{float(m2):>6.2f}"
+                if m1 or m2:
+                    CONSOLE.info(
+                        f"{'Current L2':<{col1}}: {m1 and (c or (c or cm))}{m1 or '---.---':>7} {'A':<{col2 - 8}}{co} "
+                        f"{'Voltage L2':<{col3}}: {m2 and (c or (c or cm))}{m2 or '----.--':>7} V{co}"
+                    )
+                if (m1 := cm and mqtt.get("current_l3", "")) and "." in m1:
+                    m1 = f"{float(m1):>6.3f}"
+                if (m2 := cm and mqtt.get("voltage_l3", "")) and "." in m2:
+                    m2 = f"{float(m2):>6.2f}"
+                if m1 or m2:
+                    CONSOLE.info(
+                        f"{'Current L3':<{col1}}: {m1 and (c or (c or cm))}{m1 or '---.---':>7} {'A':<{col2 - 8}}{co} "
+                        f"{'Voltage L3':<{col3}}: {m2 and (c or (c or cm))}{m2 or '----.--':>7} V{co}"
+                    )
+                if stats := dev.get("total_stats"):
+                    if str(m4 := stats.get("charge_time", "")).isdigit():
+                        m4 = (
+                            str(timedelta(seconds=int(m4)))
+                            if int(m4) != 0
+                            else "0:00:00"
+                        )
+                    CONSOLE.info(
+                        f"{'Total Charged':<{col1}}: {str(stats.get('charge_total') or '-----.---')[:-1]:>8} {stats.get('charge_unit') or '':<{col2 - 9}} "
+                        f"{'Charges (Time)':<{col3}}: {stats.get('charge_count') or '---':>4}  ({str(m4) or '-:--:--'})"
+                    )
+                    CONSOLE.info(
+                        f"{'Total Cost':<{col1}}: {(stats.get('cost') or '----.---')!s:>8} {stats.get('cost_unit') or '':<{col2 - 9}} "
+                        f"{'Total Mileage':<{col3}}: {stats.get('mile_age') or '----.--':>8} km"
+                    )
+                    CONSOLE.info(
+                        f"{'Total Savings':<{col1}}: {(stats.get('cost_saving') or '----.---')!s:>8} {stats.get('cost_unit') or '':<{col2 - 9}} "
+                        f"{'Total CO2 Saved':<{col3}}: {str(stats.get('co2_saving') or '----.---')[:-1]:>8} {stats.get('co2_saveing_unit') or ''}"
+                    )
+                m1 = cm and mqtt.get("auto_start_switch", "")
+                m2 = cm and mqtt.get("auto_charge_restart_switch", "")
+                if str(m1) or str(m2):
+                    CONSOLE.info(
+                        f"{'Autostart Sw.':<{col1}}: {str(m1) and (c or cm)}{get_enum_name(SolixSwitchMode, m1, str(m1) or '---').upper():>3} "
+                        f"{'':<{col2 - 4}}{co} "
+                        f"{'Auto Restart':<{col3}}: {str(m2) and (c or cm)}{get_enum_name(SolixSwitchMode, m2, str(m2) or '---').upper():>3}{co}"
+                    )
+                m1 = cm and mqtt.get("plug_lock_switch", "")
+                if str(m1):
+                    CONSOLE.info(
+                        f"{'Plug Lock Sw.':<{col1}}: {str(m1) and (c or cm)}{get_enum_name(SolixSwitchMode, m1 - 1, str(m1) or '---').upper():>3} "
+                        f"{'':<{col2 - 4}}{co} "
+                    )
+                m1 = cm and mqtt.get("random_delay_switch", "")
+                m2 = cm and mqtt.get("auto_phase_switch", "")
+                m4 = str(cm and mqtt.get("installed_phases", ""))
+                if str(m1) or str(m2):
+                    CONSOLE.info(
+                        f"{'Rand. Delay Sw.':<{col1}}: {str(m1) and (c or cm)}{get_enum_name(SolixSwitchMode, m1, str(m1) or '---').upper():>3} "
+                        f"{'':<{col2 - 4}}{co} "
+                        f"{'Auto Phase Sw.':<{col3}}: {str(m2) and (c or cm)}{get_enum_name(SolixSwitchMode, m2, str(m2) or '---').upper():>3} (Phases: {m4 or '-'}){co}"
+                    )
+                m1 = cm and mqtt.get("load_balance_switch", "")
+                m2 = cm and str(mqtt.get("main_breaker_limit", ""))
+                if str(m1) or m2:
+                    CONSOLE.info(
+                        f"{'Load Bal. Sw.':<{col1}}: {str(m1) and (c or cm)}{get_enum_name(SolixSwitchMode, m1, str(m1) or '---').upper():>3} "
+                        f"{'':<{col2 - 4}}{co} "
+                        f"{'Main Br. Limit':<{col3}}: {m2 and (c or cm)}{(m2 or '---'):>3} A{co}"
+                    )
+                m1 = cm and mqtt.get("solar_evcharge_switch", "")
+                m2 = str(cm and mqtt.get("solar_evcharge_mode", ""))
+                if str(m1) or m2:
+                    CONSOLE.info(
+                        f"{'PV Charge Sw.':<{col1}}: {str(m1) and (c or cm)}{get_enum_name(SolixSwitchMode, m1, str(m1) or '---').upper():>3} "
+                        f"{'':<{col2 - 4}}{co} "
+                        f"{'PV Charge Mode':<{col3}}: {m2 and (c or cm)}{get_enum_name(SolixEvChargerSolarMode, m2, m2 or '-------').replace('_', ' ').capitalize():>3} "
+                        f"({m2 or '-'}){co}"
+                    )
+                if (
+                    (m1 := str(cm and mqtt.get("solar_evcharge_min_current", "")))
+                    .replace(".", "", 1)
+                    .isdigit()
+                ):
+                    m1 = str(int(m1))
+                if (
+                    (m2 := str(cm and mqtt.get("max_evcharge_current", "")))
+                    .replace(".", "", 1)
+                    .isdigit()
+                ):
+                    m2 = str(int(m2))
+                if m1 or m2:
+                    CONSOLE.info(
+                        f"{'PV Chrg min A':<{col1}}: {m1 and (c or cm)}{m1 or '--':>3} "
+                        f"{'A':<{col2 - 4}}{co} "
+                        f"{'Charge max A':<{col3}}: {m2 and (c or cm)}{m2 or '--':>3} A{co}"
+                    )
+                if (
+                    (m1 := str(cm and mqtt.get("min_current_limit", "")))
+                    .replace(".", "", 1)
+                    .isdigit()
+                ):
+                    m1 = str(int(m1))
+                if (
+                    (m2 := str(cm and mqtt.get("max_current_limit", "")))
+                    .replace(".", "", 1)
+                    .isdigit()
+                ):
+                    m2 = str(int(m2))
+                if m1 or m2:
+                    CONSOLE.info(
+                        f"{'Min Chrg Limit':<{col1}}: {m1 and (c or cm)}{m1 or '--':>3} "
+                        f"{'A':<{col2 - 4}}{co} "
+                        f"{'Max Chrg Limit':<{col3}}: {m2 and (c or cm)}{m2 or '--':>3} A{co}"
+                    )
+                m1 = str(cm and mqtt.get("schedule_switch", ""))
+                m2 = str(cm and mqtt.get("weekend_mode", ""))
+                m3 = str(cm and mqtt.get("schedule_mode", ""))
+                if m1 or m2:
+                    CONSOLE.info(
+                        f"{'Chrg Sched. Sw.':<{col1}}: {m1 and (c or cm)}{get_enum_name(SolixSwitchModeV2, m1, m1 or '---').upper():>3} "
+                        f"{(m3 and (c or cm))}{'(' + get_enum_name(SolixPpsOutputModeV2, m3, 'unknown' if m3 else '-------').capitalize() + ')':<{col2 - 4}}{co} "
+                        f"{'Weekend Mode':<{col3}}: {m2 and (c or cm)}"
+                        f"{get_enum_name(SolixScheduleWeekendMode, m2, 'unknown' if m2 else '-------').capitalize()} ({m2 or '-'}){co} "
+                    )
+                m1 = str(cm and mqtt.get("week_start_time", ""))
+                m3 = str(cm and mqtt.get("week_end_time", ""))
+                m2 = str(cm and mqtt.get("weekend_start_time", ""))
+                m4 = str(cm and mqtt.get("weekend_end_time", ""))
+                if m1 or m2:
+                    CONSOLE.info(
+                        f"{'WK Chrg Time':<{col1}}: {m1 and (c or cm)}{m1 or '--:--':>5} - {m3 or '--:--':<{col2 - 8}}{co} "
+                        f"{'WE Chrg Time':<{col3}}: {m2 and (c or cm)}{m2 or '--:--':>5} - {m4 or '--:--':>5}{co}"
+                    )
+                m1 = str(cm and mqtt.get("wipe_up_mode", ""))
+                m2 = str(cm and mqtt.get("wipe_down_mode", ""))
+                if m1 or m2:
+                    CONSOLE.info(
+                        f"{'Wipe Up Mode':<{col1}}: {m1 and (c or cm)}{get_enum_name(SolixEvChargerWipeMode, m1, m1 or '-------').replace('_', ' ').capitalize() + ' (' + (m1 or '-') + ')':<{col2}}{co} "
+                        f"{'Wipe Down Mode':<{col3}}: {m2 and (c or cm)}{get_enum_name(SolixEvChargerWipeMode, m2, m2 or '-------').replace('_', ' ').capitalize()} "
+                        f"({m2 or '-'}){co}"
+                    )
+                m1 = str(cm and mqtt.get("smart_touch_mode", ""))
+                if (
+                    (m2 := str(cm and mqtt.get("light_brightness", "")))
+                    .replace(".", "", 1)
+                    .isdigit()
+                ):
+                    m2 = str(int(m2))
+                if m1 or m2:
+                    CONSOLE.info(
+                        f"{'Smrt Touch Mode':<{col1}}: {m1 and (c or cm)}{get_enum_name(SolixSmartTouchMode, m1, m1 or '-------').replace('_', ' ').capitalize() + ' (' + (m1 or '-') + ')':<{col2}}{co} "
+                        f"{'Light Brightn.':<{col3}}: {m2 and (c or cm)}{m2 or '---':>3} %{co}"
+                    )
+                m1 = cm and mqtt.get("light_off_schedule_switch", "")
+                m2 = str(cm and mqtt.get("light_off_start_time", ""))
+                m4 = str(cm and mqtt.get("light_off_end_time", ""))
+                if str(m1) or m2:
+                    CONSOLE.info(
+                        f"{'Light Off Sched':<{col1}}: {str(m1) and (c or cm)}{get_enum_name(SolixSwitchMode, m1, str(m1) or '---').upper():>3} {'':<{col2 - 4}}{co} "
+                        f"{'Light Off Time':<{col3}}: {m2 and (c or cm)}{m2 or '--:--':>5} - {m4 or '--:--':>5}{co}"
+                    )
+                m1 = cm and mqtt.get("modbus_switch", "")
+                m3 = str(cm and mqtt.get("ip_address", ""))
+                m2 = str(cm and mqtt.get("tcp_port", ""))
+                m4 = str(cm and mqtt.get("tcp_timeout_seconds", ""))
+                if str(m1) or m2:
+                    CONSOLE.info(
+                        f"{'Modbus Sw/IP':<{col1}}: {str(m1) and (c or cm)}{get_enum_name(SolixSwitchMode, m1, str(m1) or '---').upper():>3} "
+                        f"{(m3 and (c or cm))}{'(' + (m3 or '---.---.---.---') + ')':<{col2 - 4}}{co} "
+                        f"{'TCP Port/TiOut':<{col3}}: {m2 and (c or cm)}{m2 or '----':>4} ({m4 or '---'} Sec){co}"
+                    )
+
+            elif devtype in [
+                SolixDeviceType.PPS.value,
+                SolixDeviceType.SOLARBANK_PPS.value,
+                SolixDeviceType.CHARGER.value,
+            ]:
+                if m2 := str(dev.get("status", "")):
+                    CONSOLE.info(
+                        f"{'Cloud Status':<{col1}}: {str(dev.get('status_desc', '-------')).capitalize():<{col2}} "
+                        f"{'Status Code':<{col3}}: {m2!s}"
+                    )
+                if m2 := (c or cm) and str(mqtt.get("charging_status", "")):
+                    CONSOLE.info(
+                        f"{'Charge Status':<{col1}}: {m2 and (c or cm)}{get_enum_name(SolixPpsChargingStatus, m2 or dev.get('charging_status'), '-------').replace('_', '').title():<{col2}}{co} "
+                        f"{'Status Code':<{col3}}: {m2 and (c or cm)}{m2 or dev.get('charging_status', '-')!s}{co}"
+                    )
+                m1 = cm and str(mqtt.get("last_update", ""))
+                m2 = cm and mqtt.get("remaining_time_hours", "")
+                if m1 or str(m2):
+                    CONSOLE.info(
+                        f"{'Last Update':<{col1}}: {m1 and (c or cm)}{m1:<{col2}}{co} "
+                        f"{'Time Remaining':<{col1}}: {str(m2) and (c or cm)}"
+                        f"{(timedelta(hours=m2) if str(m2) else '--:--')!s}{co}"
+                    )
+                m1 = cm and mqtt.get("light_switch", "")
+                m3 = cm and str(mqtt.get("light_timeout_minutes", ""))
+                m2 = cm and str(mqtt.get("light_mode", ""))
+                if str(m1) or m2:
+                    CONSOLE.info(
+                        f"{'Light Sw./Tout':<{col1}}: {str(m1) and (c or cm)}{get_enum_name(SolixSwitchMode, m1, str(m1) or '---').upper():>3}{co} / "
+                        f"{m3 and (c or cm)}{(m3 or '---') + ' Min.':<{col2 - 6}}{co} "
+                        f"{'Light Mode':<{col1}}: {m2 and (c or cm)}"
+                        f"{get_enum_name(SolixPpsDisplayMode, m2, 'unknown' if m2 else '----').capitalize() + ' (' + (m2 or '-') + ')':<{col2 - 6}}{co} "
+                    )
+                m1 = cm and mqtt.get("display_switch", "")
+                m2 = cm and str(mqtt.get("display_timeout_seconds", ""))
+                m3 = cm and str(mqtt.get("display_mode", ""))
+                if str(m1) or m2 or m3:
+                    CONSOLE.info(
+                        f"{'Display Ctrl':<{col1}}: {str(m1) and (c or cm)}{get_enum_name(SolixSwitchMode, m1, str(m1) or '---').upper():>3}{co} / "
+                        f"{m3 and (c or cm)}{get_enum_name(SolixPpsDisplayMode, m3, 'unknown' if m3 else '----').capitalize() + ' (' + m3 + ')':<{col2 - 6}}{co} "
+                        f"{'Display Timeout':<{col3}}: {m2 and (c or cm)}{(m2 or '----'):>4} Sec.{co}"
+                    )
+                m1 = cm and mqtt.get("display_brightness", "")
+                m2 = cm and str(mqtt.get("display_timeout_mode", ""))
+                if m1 or m2:
+                    CONSOLE.info(
+                        f"{'Display Bright.':<{col1}}: {m1 and (c or cm)}{m1 or '---':>3} {'%':<{col2 - 4}}{co} "
+                        f"{'Display Timeout':<{col3}}: {m2 and (c or cm)}{get_enum_name(SolixDisplayTimeoutMode, m2, '----').replace('_', ''):>4} Sec.  (Mode: {m2 or '-'}){co}"
+                    )
+                m1 = (
+                    cm and str(mqtt.get("usage_mode", ""))
+                    if devtype == SolixDeviceType.PPS.value
+                    else ""
+                )
+                m2 = cm and str(mqtt.get("", ""))
+                if m1 or m2:
+                    CONSOLE.info(
+                        f"{'Usage Mode':<{col1}}: {m1 and (c or cm)}{get_enum_name(SolixPpsUsageMode, m1, '----').replace('_', ' ').replace('_', ' ').title() + ' (' + (m1 or '-') + ')':<{col2}}{co} "
+                        #f"{'Knob Mode':<{col3}}: {m2 and (c or cm)}{get_enum_name(SolixKnobMode, m2, '----').title()} ({m2 or '-'}){co}"
+                    )
+                m1 = (
+                    cm and str(mqtt.get("usage_mode", ""))
+                    if devtype == SolixDeviceType.CHARGER.value
+                    else ""
+                )
+                m2 = cm and str(mqtt.get("knob_mode", ""))
+                if m1 or m2:
+                    CONSOLE.info(
+                        f"{'Usage Mode':<{col1}}: {m1 and (c or cm)}{get_enum_name(SolixChargerUsageMode, m1, '----').replace('_', ' ').replace('_', ' ').title() + ' (' + (m1 or '-') + ')':<{col2}}{co} "
+                        f"{'Knob Mode':<{col3}}: {m2 and (c or cm)}{get_enum_name(SolixKnobMode, m2, '----').title()} ({m2 or '-'}){co}"
+                    )
+                m1 = cm and mqtt.get("clock_switch", "")
+                m3 = cm and str(mqtt.get("clock_mode", ""))
+                m2 = cm and mqtt.get("holiday_switch", "")
+                if str(m1) or str(m2) or m3:
+                    CONSOLE.info(
+                        f"{'Clock Control':<{col1}}: {str(m1) and (c or cm)}{get_enum_name(SolixSwitchMode, m1, str(m1) or '---').upper():>3}{co} / "
+                        f"{m3 and (c or cm)}{'Mode: ' + get_enum_name(SolixClockMode, m3, '---').strip('_') + ' (' + (m3 or '-') + ')':<{col2 - 6}}{co} "
+                        f"{'Holiday Switch':<{col3}}: {str(m2) and (c or cm)}{get_enum_name(SolixSwitchMode, m2, str(m2) or '---').upper():>3}{co}"
+                    )
+                m1 = cm and str(mqtt.get("theme_id", ""))
+                m2 = (
+                    ""  # TODO: Use method to extract ID from Api cache once implemented
+                )
+                if m1:
+                    CONSOLE.info(
+                        f"{'Clock Theme ID':<{col1}}: {m1 and (c or cm)}{m1 or '----------':<{col2}}{co} "
+                        f"{'Theme Name':<{col3}}: {m2 and c}{m2 or '----------'}{co}"
+                    )
+                m1 = cm and str(mqtt.get("clock_display_start_hour", ""))
+                m3 = cm and str(mqtt.get("clock_display_end_hour", ""))
+                m2 = cm and str(mqtt.get("clock_display_weekdays", "")).replace(
+                    "'", ""
+                ).replace(" ", "")
+                if m1 or m2 or m3:
+                    m1 = (
+                        f"{int(m1):02d}:{mqtt.get('clock_display_start_minute') or 0:02d}"
+                        if m1
+                        else m1
+                    )
+                    m3 = (
+                        f"{int(m3):02d}:{mqtt.get('clock_display_end_minute') or 0:02d}"
+                        if m3
+                        else m3
+                    )
+                    CONSOLE.info(
+                        f"{'Clock schedule':<{col1}}: {m1 and (c or cm)}{m1 or '--:--'}{co} - {m3 and (c or cm)}{m3 or '--:--':<{col2 - 8}}{co} "
+                        f"{'Weekdays':<{col3}}: {m2 and (c or cm)}{m2}{co}"
+                    )
+                m1 = cm and mqtt.get("ac_output_power_switch", "")
+                m2 = cm and mqtt.get("dc_output_power_switch", "")
+                m3 = cm and str(mqtt.get("ac_output_mode", ""))
+                m4 = cm and str(mqtt.get("dc_12v_output_mode", ""))
+                if str(m1) or str(m2) or m3 or m4:
+                    # V2 PPS have different smart mode states than V1
+                    v2 = mdev.pn == "A1763"
+                    CONSOLE.info(
+                        f"{'AC Out Ctrl':<{col1}}: {str(m1) and (c or cm)}{get_enum_name(SolixSwitchMode, m1, str(m1) or '---').upper():>3}{co} / "
+                        f"{m3 and (c or cm)}{get_enum_name(SolixPpsOutputModeV2 if v2 else SolixPpsOutputMode, m3, 'unknown').capitalize().split('_', maxsplit=1)[0] + ' (' + (m3 or '-') + ')':<{col2 - 6}}{co} "
+                        f"{'DC Out Ctrl':<{col3}}: {str(m2) and (c or cm)}{get_enum_name(SolixSwitchMode, m2, str(m2) or '---').upper():>3}{co} / "
+                        f"{m4 and (c or cm)}{get_enum_name(SolixPpsOutputModeV2 if v2 else SolixPpsOutputMode, m4, 'unknown').capitalize().split('_', maxsplit=1)[0] + ' (' + (m4 or '-') + ')'}{co}"
+                    )
+                m1 = cm and mqtt.get("dc_12v_auto_on", "")
+                if str(m1):
+                    CONSOLE.info(
+                        f"{'DC 12V Auto On':<{col1}}: {str(m1) and (c or cm)}{get_enum_name(SolixSwitchMode, m1, str(m1) or '---').upper():>3}{'':<{col2 - 3}}{co} "
+                    )
+                m1 = cm and mqtt.get("backup_charge_switch", "")
+                m2 = cm and str(mqtt.get("exp_1_type", ""))
+                if str(m1) or m2:
+                    CONSOLE.info(
+                        f"{'Backup charge':<{col1}}: {str(m1) and (c or cm)}{get_enum_name(SolixSwitchMode, m1, str(m1) or '---').upper():>3}{'':<{col2 - 3}}{co} "
+                        f"{'Exp. Type':<{col3}}: {m2 and (c or cm)}{m2 or 'Unknown'}{co}"
+                    )
+                m1 = cm and mqtt.get("backup_charge_switch", "")
+                m2 = cm and mqtt.get("ac_fast_charge_switch", "")
+                if str(m1) or str(m2):
+                    CONSOLE.info(
+                        f"{'Backup charge':<{col1}}: {str(m1) and (c or cm)}{get_enum_name(SolixSwitchMode, m1, str(m1) or '---').upper():>3}{'':<{col2 - 3}}{co} "
+                        f"{'Fast charge':<{col3}}: {str(m2) and (c or cm)}{get_enum_name(SolixSwitchMode, m2, str(m2) or '---').upper():>3}{co}"
+                    )
+                m1 = cm and mqtt.get("port_memory_switch", "")
+                m2 = cm and mqtt.get("energy_saving_switch", "")
+                if str(m1) or str(m2):
+                    CONSOLE.info(
+                        f"{'Port Memory':<{col1}}: {str(m1) and (c or cm)}{get_enum_name(SolixSwitchMode, m1, str(m1) or '---').upper():>3}{'':<{col2 - 3}}{co} "
+                        f"{'Energy Saving':<{col3}}: {str(m2) and (c or cm)}{get_enum_name(SolixSwitchMode, m2, str(m2) or '---').upper():>3}{co}"
+                    )
+                m1 = cm and (mqtt.get("battery_soc", "") or dev.get("battery_soc", ""))
+                m2 = cm and mqtt.get("power_cutoff", "")
+                m3 = cm and (
+                    str(mqtt.get("expansion_packs", ""))
+                    or str(dev.get("expansion_packs", ""))
+                )
+                m4 = cm and str(mqtt.get("max_soc", ""))
+                if str(m1) or str(m2):
+                    CONSOLE.info(
+                        f"{'Battery SoC Tot':<{col1}}: {m1 and (c or cm)}{m1 or '---':>4} %{co} (Expansions: {m3 and (c or cm)}{m3 or '-'}{co}{')':<{col2 - 20}}"
+                        f"{'SoC Min/Max':<{col3}}: {m2 and (c or cm)}{m2 or '---':>4} % / {m4 or '---':>3} %{co}"
+                    )
+                if m1 := cm and (
+                    mqtt.get("main_battery_soc", "") or mqtt.get("battery_soc", "")
+                ):
+                    soc = f"{m1:>4} %"
+                    m2 = cm and str(mqtt.get("temperature", ""))
+                    batstr = "Main B." if "main_battery_soc" in mqtt else "Battery"
+                    if m2 and mqtt.get("temp_unit_fahrenheit"):
+                        m2 = f"{float(m2) * 9 / 5 + 32:>4} °F"
+                    else:
+                        m2 = f"{m2 or '---':>4} {'°F' if mqtt.get('temp_unit_fahrenheit') else '°C'}"
+                    if m3 := cm and mqtt.get("battery_soh", ""):
+                        m3 = f"{float(m3):6.2f}"
+                    CONSOLE.info(
+                        f"{batstr + ' SoC/SoH':<{col1}}: {m1 and (c or cm)}{soc} /{m3 or ' --.--':>7} {'%':<{col2 - 16}}{co} "
+                        f"{batstr + ' Temp.':<{col3}}: {m2 and (c or cm)}{m2:>7}{co}"
+                    )
+                for i in range(1, 6):
+                    if m1 := cm and mqtt.get(f"exp_{i}_soc", ""):
+                        soc = f"{m1:>4} %"
+                        m2 = cm and mqtt.get(f"exp_{i}_temperature", "")
+                        if m2 and mqtt.get("temp_unit_fahrenheit"):
+                            m2 = f"{float(m2) * 9 / 5 + 32:>4} °F"
+                        else:
+                            m2 = f"{m2 or '---':>4} {'°F' if mqtt.get('temp_unit_fahrenheit') else '°C'}"
+                        if m3 := cm and mqtt.get(f"exp_{i}_soh", ""):
+                            m3 = f"{float(m3):6.2f}"
+                        m4 = cm and mqtt.get(f"exp_{i}_temperature", "")
+                        CONSOLE.info(
+                            f"{'Exp. ' + str(i) + ' SoC/SoH':<{col1}}: {m1 and (c or cm)}{soc} /{m3 or ' --.--':>7} {'%':<{col2 - 16}}{co} "
+                            f"{'Exp. ' + str(i) + ' Temp.':<{col3}}: {m2 and (c or cm)}{m2:>7}{co}"
+                        )
+                    else:
+                        break
+                energy = f"{dev.get('battery_energy', '----'):>4} Wh"
+                if "battery_capacity" in dev:
+                    if m1 := cm and mqtt.get("battery_soc_ah", ""):
+                        m1 = f" ({m1 or '-.---'} Ah)"
+                    CONSOLE.info(
+                        f"{'Battery Energy':<{col1}}: {cc}{energy}{co}{m1 and (c or cm)}{m1:{col2 - len(energy)}}{co} "
+                        f"{'Capacity':<{col3}}: {cc}{customized.get('battery_capacity') or dev.get('battery_capacity', '----')!s:>4} Wh{co}"
+                    )
+                unit = "W"
+                m1 = cm and str(
+                    mqtt.get("max_load", "") or mqtt.get("output_power_limit", "")
+                )
+                m2 = cm and str(mqtt.get("device_timeout_minutes", ""))
+                if m1 or (m2 and devtype != SolixDeviceType.CHARGER.value):
+                    CONSOLE.info(
+                        f"{'Max. Load/Out':<{col1}}: {m1 and (c or cm)}{m1 or '----':>4} {unit:<{col2 - 5}}{co} "
+                        f"{'Device Timeout':<{col3}}: {m2 and (c or cm)}{m2 or '----':>4} Min.{co}"
+                    )
+                m1 = (cm and mqtt.get("photovoltaic_power", "")) or dev.get(
+                    "input_power", ""
+                )
+                m2 = (
+                    (cm and mqtt.get("output_power", ""))
+                    or dev.get("output_power", "")
+                    or dev.get("to_home_load", "")
+                )
+                if m1 or (m2 and devtype != SolixDeviceType.CHARGER.value):
+                    m3 = cm and mqtt.get("pv_yield", "")
+                    m4 = cm and mqtt.get("output_energy", "")
+                    m5 = get_enum_name(
+                        SolixPpsDcChargingStatus,
+                        cm and str(mqtt.get("pv_1_status", "")),
+                        "",
+                    )
+                    CONSOLE.info(
+                        f"{'Solar Power':<{col1}}: {m1 and (c or cm)}{m1 or '----':>4} {unit}{m3 and (c or cm)}"
+                        f"{((' (' + m3 + ' kWh)') if m3 else (' (' + m5 + ')') if m5 else ''):<{col2 - 6}}{co} "
+                        f"{'Output Power':<{col3}}: {m2 and (c or cm)}{m2 or '----':>4} {unit}{m4 and (c or cm)}{((' (' + m4 + ' kWh)') if m4 else '')}{co}"
+                    )
+                # show each MPPT if available
+                m1 = (cm and mqtt.get("pv_1_power", "")) or dev.get("solar_power_1")
+                m2 = (cm and mqtt.get("pv_2_power", "")) or dev.get("solar_power_2")
+                if m1 or m2:
+                    names = dev.get("pv_name") or {}
+                    name1 = names.get("pv1_name") or ""
+                    name2 = names.get("pv2_name") or ""
+                    CONSOLE.info(
+                        f"{'Solar Ch_1':<{col1}}: {m1 and (c or cm)}{m1 or '---':>4} {unit}{co}{(' (' + name1 + ')' if name1 else ''):<{col2 - 6}} "
+                        f"{'Solar Ch_2':<{col3}}: {m2 and (c or cm)}{m2 or '---':>4} {unit}{co}{(' (' + name2 + ')' if name2 else '')}"
+                    )
+                m1 = (cm and mqtt.get("bat_charge_power", "")) or dev.get(
+                    "bat_charge_power", ""
+                )
+                m2 = (cm and mqtt.get("bat_discharge_power", "")) or dev.get(
+                    "bat_discharge_power", ""
+                )
+                if (m1 and devtype != SolixDeviceType.CHARGER.value) or m2:
+                    m3 = cm and mqtt.get("charged_energy", "")
+                    m4 = cm and mqtt.get("discharged_energy", "")
+                    CONSOLE.info(
+                        f"{'Battery Charge':<{col1}}: {m1 and (c or cm)}{m1 or '---':>4} {unit}{m3 and (c or cm)}{(' (' + m3 + ' kWh)') if m3 else '':<{col2 - 6}}{co} "
+                        f"{'Battery Dischrg':<{col3}}: {m2 and (c or cm)}{m2 or '---':>4} {unit}{m4 and (c or cm)}{(' (' + m4 + ' kWh)') if m4 else ''}{co}"
+                    )
+                if m1 := cm and mqtt.get("device_efficiency", ""):
+                    m1 = f"{float(m1):6.2f}"
+                if m2 := cm and mqtt.get("battery_efficiency", ""):
+                    m2 = f"{float(m2):6.2f}"
+                if m1 or m2:
+                    CONSOLE.info(
+                        f"{'System Eff.':<{col1}}: {cc}{m1 or '  --.--':>7} {'%':<{col2 - 8}}{co} "
+                        f"{'Battery Eff.':<{col3}}: {cc}{m2 or '  --.--':>7} %{co}"
+                    )
+                m1 = (cm and mqtt.get("battery_power_signed", "")) or dev.get(
+                    "charging_power"
+                )
+                m2 = str(dev.get("sub_pack_temp_alarm", ""))
+                if m1 or m2:
+                    CONSOLE.info(
+                        f"{'Battery Power':<{col1}}: {m1 and (c or cm)}{m1 or '---':>4} {unit:<{col2 - 5}}{co} "
+                        f"{'Exp Temp Alert':<{col3}}: {m2 or '-'}{co}"
+                    )
+                m1 = cm and mqtt.get("dc_input_power", "")
+                m3 = cm and mqtt.get("dc_input_power_total", "")
+                m2 = cm and str(mqtt.get("dc_charging_status", ""))
+                if m1 or m2 or m3:
+                    CONSOLE.info(
+                        f"{'DC In Pwr/Tot':<{col1}}: {m1 and (c or cm)}{m1 or '----':>4} {unit}{co} / {m3 and (c or cm)}{m3 or '----':>4} {unit:<{col2 - 14}}{co} "
+                        f"{'DC Chrg Status':<{col3}}: {m2 and (c or cm)}{get_enum_name(SolixPpsDcChargingStatus, m2, 'unknown' if m2 else '----').capitalize() + ' (' + (m2 or '-') + ')'}{co}"
+                    )
+                m1 = cm and mqtt.get("dc_output_power_total", "")
+                if m2 := cm and str(mqtt.get("dc_output_timeout_seconds", "")):
+                    m2 = str(timedelta(seconds=int(m2)))
+                if m1 or m2:
+                    if "." in str(m1):
+                        m1 = f"{float(m1):.2f}"
+                    CONSOLE.info(
+                        f"{'DC Out Pwr Tot':<{col1}}: {m1 and (c or cm)}{m1 or '----':>4} {unit:<{col2 - 5}}{co} "
+                        f"{'DC Out Timeout':<{col3}}: {m2 and (c or cm)}{m2 or '--:--'}{co}"
+                    )
+                m1 = cm and mqtt.get("input_power_total", "")
+                m2 = cm and str(mqtt.get("ac_input_plug_status", ""))
+                if m1 or m2:
+                    CONSOLE.info(
+                        f"{'Input Pwr Total':<{col1}}: {m1 and (c or cm)}{m1 or '----':>4} {unit:<{col2 - 5}}{co} "
+                        f"{'AC Input Plug':<{col3}}: {m2 and (c or cm)}{get_enum_name(SolixConnectionStatus, m2, 'unknown' if m2 else '----').title()} ({m2 or '-'}){co}"
+                    )
+                m1 = cm and mqtt.get("ac_input_power", "")
+                m3 = cm and mqtt.get("ac_input_power_switch", "")
+                m2 = cm and mqtt.get("ac_input_limit", "")
+                if m1 or m2 or str(m3):
+                    CONSOLE.info(
+                        f"{'AC Input Power':<{col1}}: {m1 and (c or cm)}{m1 or '----':>4} {unit}{co} / "
+                        f"({str(m3) and (c or cm)}{get_enum_name(SolixSwitchMode, m3, str(m3) or '---').upper():>3}{co}{')':<{col2-12}}"
+                        f"{'AC Charge Limit':<{col3}}: {m2 and (c or cm)}{m2 or '----':>4} {unit}{co}"
+                    )
+                m1 = cm and mqtt.get("ac_output_power", "")
+                m3 = cm and mqtt.get("ac_frequency", "")
+                m2 = cm and mqtt.get("output_power_total", "")
+                if m4 := cm and str(mqtt.get("ac_output_timeout_seconds", "")):
+                    m4 = str(timedelta(seconds=int(m4)))
+                if m1 or m2 or m3 or m4:
+                    CONSOLE.info(
+                        f"{'AC Output Power':<{col1}}: {m1 and (c or cm)}{m1 or '----':>4} {unit}{m3 and (c or cm)}{' / ' + (m3 or '--') + ' Hz':<{col2 - 6}}{co} "
+                        f"{'Out Tot/AC Off':<{col3}}: {m2 and (c or cm)}{m2 or '----':>4} {unit}{co} / {m4 and (c or cm)}{m4 or '-:--:--'}{co}"
+                    )
+                m1 = str(dev.get("phase", ""))
+                m2 = str(dev.get("branch_ct_number", ""))
+                m3 = str(dev.get("main_ct_number", ""))
+                m4 = str(dev.get("main_branch_check_status", ""))
+                if m1 or m2:
+                    CONSOLE.info(
+                        f"{'Phase installed':<{col1}}: L({m1 or '-'}) / Main CT({m3 or '-'}{')':<{col2 - 16}}{co} "
+                        f"{'Branch / Status':<{col3}}: Br CT({m2 or '-'}) / Check({m4 or '-'}){co}"
+                    )
+                m1 = str(dev.get("charge_protect_threshold", ""))
+                m2 = str(dev.get("protection_status", ""))
+                m3 = str(dev.get("discharge_protect_threshold", ""))
+                if m1 or m2:
+                    CONSOLE.info(
+                        f"{'Prot. Threshold':<{col1}}: Chg({m1 or '---':>3}) / Dischg({m3 or '---':>3}{')':<{col2 - 21}}{co} "
+                        f"{'Protect Status':<{col3}}: {m2 or '-'}{co}"
+                    )
+                for idx in [
+                    "usb",
+                    "usbc_1",
+                    "usbc_2",
+                    "usbc_3",
+                    "usbc_4",
+                    "usba_1",
+                    "usba_2",
+                    "dc_12v_1",
+                    "dc_12v_2",
+                ]:
+                    if m1 := cm and str(mqtt.get(f"{idx}_power", "")):
+                        m1 = f"{float(m1):>5.2f}"
+                        if m3 := cm and str(mqtt.get(f"{idx}_status", "")):
+                            m3 = f" ({get_enum_name(SolixChargerPortStatus, m3, m3) if devtype == SolixDeviceType.CHARGER.value else get_enum_name(SolixPpsPortStatus, m3, m3)!s})"
+                        if m2 := cm and str(mqtt.get(f"{idx}_voltage", "")):
+                            m2 = f"{float(m2):>5.2f}"
+                        if m4 := cm and str(mqtt.get(f"{idx}_current", "")):
+                            m4 = f"{float(m4):>5.3f}"
+                        if (
+                            m5 := cm and mqtt.get(f"{idx}_switch", "")
+                        ) == "" and idx.startswith("usba"):
+                            # Alternatively check shared switch for USB A
+                            m5 = cm and mqtt.get("usba_switch", "")
+                        idxstr = idx.replace("usb", "usb-" if idx != "usb" else idx).replace("_", " ").upper()
+                        CONSOLE.info(
+                            f"{idxstr + ' Power':<{col1}}: {m1 and (c or cm)}{m1 or '----':>5} {unit}{m3:<{col2 - 7}}{co} "
+                            f"{idxstr + ' V/A/Sw':<{col3}}: {m2 and (c or cm)}{m2 or '--.--':>5} V / {m4 and (c or cm)}{m4 or '-.---':>5} A ({get_enum_name(SolixSwitchMode, m5, str(m5) or '---').upper()}){co}"
+                        )
+                for idx in ["usbc_1", "usbc_2", "usbc_3", "usbc_4", "usba"]:
+                    m1 = cm and mqtt.get(f"{idx}_timer_seconds", "")
+                    m3 = cm and mqtt.get(f"{idx}_timer_switch", "")
+                    m6 = cm and mqtt.get(f"{idx}_priority", "")
+                    if str(m1) or str(m3) or str(m6):
+                        m2 = cm and mqtt.get(f"{idx}_timer_remaining_seconds", "")
+                        m4 = cm and mqtt.get(f"{idx}_timer_remaining_timestamp", "")
+                        if str(m1).isdigit():
+                            m1 = timedelta(seconds=m1)
+                        if str(m2).isdigit():
+                            m2 = (
+                                timedelta(seconds=sec)
+                                if (
+                                    sec := max(
+                                        0,
+                                        int(
+                                            m2
+                                            - (
+                                                int(datetime.now().timestamp()) - m4
+                                                if (m4)
+                                                else 0
+                                            )
+                                        ),
+                                    )
+                                )
+                                else ""
+                            )
+                        idxstr = idx.replace("usb", "usb-").replace("_", " ").upper()
+                        CONSOLE.info(
+                            f"{idxstr + ' Timer':<{col1}}: {m1 and (c or cm)}{str(m1) or '--:--:--':>8} {str(m3) and (c or cm)}({get_enum_name(SolixSwitchMode, m3, str(m3) or '--').upper() + ')':<{col2 - 10}}{co} "
+                            f"{idxstr + ' Remain':<{col3}}: {m2 and (c or cm)}{str(m2) or '--:--:--':>8}{co}  {str(m6) and (c or cm)}(Prio {str(m6) or '-'}){co}"
+                        )
+                    m1 = cm and str(mqtt.get(f"{idx}_start_hour", ""))
+                    m3 = cm and mqtt.get(f"{idx}_start_switch", "")
+                    m2 = cm and str(mqtt.get(f"{idx}_start_weekdays", "")).replace(
+                        "'", ""
+                    ).replace(" ", "")
+                    if m1 or m2 or str(m3):
+                        m1 = (
+                            f"{int(m1):02d}:{mqtt.get(f'{idx}_start_minute') or 0:02d}"
+                            if m1
+                            else m1
+                        )
+                        CONSOLE.info(
+                            f"{idxstr + ' Start':<{col1}}: {m1 and (c or cm)}{m1 or '--:--':>5}{co} {str(m3) and (c or cm)}({get_enum_name(SolixSwitchMode, m3, str(m3) or '--').upper() + ')':<{col2 - 7}}{co} "
+                            f"{idxstr + ' Wkdays':<{col3}}: {m2 and (c or cm)}{m2}{co}"
+                        )
+                    m1 = cm and str(mqtt.get(f"{idx}_end_hour", ""))
+                    m3 = cm and mqtt.get(f"{idx}_end_switch", "")
+                    m2 = cm and str(mqtt.get(f"{idx}_end_weekdays", "")).replace(
+                        "'", ""
+                    ).replace(" ", "")
+                    if m1 or m2 or str(m3):
+                        m1 = (
+                            f"{int(m1):02d}:{mqtt.get(f'{idx}_end_minute') or 0:02d}"
+                            if m1
+                            else m1
+                        )
+                        CONSOLE.info(
+                            f"{idxstr + ' End':<{col1}}: {m1 and (c or cm)}{m1 or '--:--':>5}{co} {str(m3) and (c or cm)}({get_enum_name(SolixSwitchMode, m3, str(m3) or '--').upper() + ')':<{col2 - 7}}{co} "
+                            f"{idxstr + ' Wkdays':<{col3}}: {m2 and (c or cm)}{m2}{co}"
+                        )
+                if (m1 := cm and mqtt.get("ac_1_voltage", "")) and "." in m1:
+                    m1 = f"{float(m1):>5.2f}"
+                if (m3 := cm and mqtt.get("ac_1_current", "")) and "." in m3:
+                    m3 = f"{float(m3):>5.3f}"
+                m5 = cm and mqtt.get("ac_1_switch", "")
+                m6 = cm and mqtt.get("ac_2_switch", "")
+                if m1 or m3 or str(m5):
+                    if (m2 := cm and mqtt.get("ac_2_voltage", "")) and "." in m2:
+                        m2 = f"{float(m2):>5.2f}"
+                    if (m4 := cm and mqtt.get("ac_2_current", "")) and "." in m4:
+                        m4 = f"{float(m4):>5.3f}"
+                    CONSOLE.info(
+                        f"{'AC 1 V/A/Sw':<{col1}}: {m1 and (c or cm)}{m1 or '--.--':>5} V / {m3 and (c or cm)}{(m3 or '-.---') + ' A (' + get_enum_name(SolixSwitchMode, m5, str(m5) or '--').upper() + ')':<{col2 - 10}}{co} "
+                        f"{'AC 2 V/A/Sw':<{col3}}: {m2 and (c or cm)}{m2 or '--.--':>5} V / {m4 and (c or cm)}{m4 or '-.---':>5} A ({get_enum_name(SolixSwitchMode, m6, str(m6) or '--').upper()}){co}"
+                    )
+                m1 = cm and mqtt.get("device_switch", "")
+                m3 = cm and str(mqtt.get("temperature", ""))
+                m2 = cm and str(mqtt.get("charger_mode", ""))
+                if (m3 and devtype == SolixDeviceType.CHARGER.value) or str(m1) or m2:
+                    if m3 and mqtt.get("temp_unit_fahrenheit"):
+                        m3 = f"{float(m3) * 9 / 5 + 32:>4} °F"
+                    else:
+                        m3 = f"{m3 or '---':>4} {'°F' if mqtt.get('temp_unit_fahrenheit') else '°C'}"
+                    CONSOLE.info(
+                        f"{'Device / Temp':<{col1}}: {str(m1) and (c or cm)}{get_enum_name(SolixSwitchMode, m1, str(m1) or '---').upper() + ' / ' + m3:<{col2}}{co} "
+                        f"{'Charger Mode':<{col3}}: {m2 and (c or cm)}{get_enum_name(SolixChargerMode, m2, 'Unknown (' + str(m2) + ')').capitalize()}{co}"
+                    )
+                m1 = cm and mqtt.get("output_power", "")
+                m2 = cm and mqtt.get("charge_power_limit", "")
+                if (m1 and devtype == SolixDeviceType.CHARGER.value) or m2:
+                    CONSOLE.info(
+                        f"{'Output Power':<{col1}}: {m1 and (c or cm)}{m1 or '----':>4} {unit:<{col2 - 5}}{co} "
+                        f"{'Charge Limit':<{col3}}: {m2 and (c or cm)}{m2 or '----':>4} {unit}{co}"
+                    )
+                m1 = cm and mqtt.get("reverse_power_limit", "")
+                m2 = cm and mqtt.get("reverse_power_limit_min", "")
+                m4 = cm and mqtt.get("reverse_power_limit_max", "")
+                if m1 or m2 or m4:
+                    CONSOLE.info(
+                        f"{'Reverse Limit':<{col1}}: {m1 and (c or cm)}{m1 or '----':>4} {unit:<{col2 - 5}}{co} "
+                        f"{'Reverse Ctrl':<{col3}}: {m2 and (c or cm)}{m2 or '????'} - {m4 or '????'} {unit}{co}"
+                    )
+                m1 = cm and str(mqtt.get("car_battery_type", ""))
+                m2 = cm and str(mqtt.get("car_battery_voltage_type", ""))
+                if m1 or m2:
+                    CONSOLE.info(
+                        f"{'Battery Type':<{col1}}: {m1 and (c or cm)}{get_enum_name(SolixBatteryType, m1, str(m1) or '-----').replace('_', ' ').title():<{col2}}{co} "
+                        f"{'Start Voltage':<{col3}}: {m2 and (c or cm)}{get_enum_name(SolixBatteryVoltageType, m2, str(m2) or '-----').replace('_', ' ').title():>6}{co}"
+                    )
+                if m1 := cm and mqtt.get("battery_voltage", ""):
+                    m1 = f"{float(m1):.1f}"
+                if m2 := cm and mqtt.get("charge_voltage_limit", ""):
+                    m2 = f"{float(m2):.1f}"
+                if m1 or m2:
+                    CONSOLE.info(
+                        f"{'Battery Voltage':<{col1}}: {m1 and (c or cm)}{m1 or '--.-':>4} {'V':<{col2 - 5}}{co} "
+                        f"{'Voltage Limit':<{col3}}: {m2 and (c or cm)}{m2 or '--.-':>4} V{co}"
+                    )
+                m1 = cm and mqtt.get("charge_power_limit_min", "")
+                m3 = cm and mqtt.get("charge_power_limit_max", "")
+                if m2 := cm and mqtt.get("charge_voltage_limit_min", ""):
+                    m2 = f"{float(m2):.1f}"
+                if m4 := cm and mqtt.get("charge_voltage_limit_max", ""):
+                    m4 = f"{float(m4):.1f}"
+                if m1 or m2:
+                    CONSOLE.info(
+                        f"{'Charge Ctrl':<{col1}}: {m1 and (c or cm)}{(m1 or '????') + ' - ' + (m3 or '????') + ' ' + unit:<{col2}}{co} "
+                        f"{'Voltage Ctrl':<{col3}}: {m2 and (c or cm)}{m2 or '??.?'} - {m4 or '??.?'} V{co}"
+                    )
+                m1 = cm and str(mqtt.get("active_device_timeout_minutes", ""))
+                m2 = cm and str(mqtt.get("device_timeout_minutes", ""))
+                m4 = cm and mqtt.get("device_timeout_switch", "")
+                if m1:
+                    CONSOLE.info(
+                        f"{'Device Timeout':<{col1}}: {m1 and (c or cm)}{m1 or '----':>4} {' Min.':<{col2 - 5}}{co} "
+                        f"{'Timeout Ctrl':<{col3}}: {m2 and (c or cm)}{m2 or '----':>4} Min. {'(Awake ' + get_enum_name(SolixSwitchMode, m4, str(m4) or '--').upper() + ')'}{co}"
+                    )
+                # attached device info
+                m1 = cm and str(mqtt.get("device_1_status", ""))
+                m2 = cm and str(mqtt.get("xt60i_cable", ""))
+                if m1 or m2:
+                    CONSOLE.info(
+                        f"{'Dev 1 Status':<{col1}}: {m1 and (c or cm)}{get_enum_name(SolixConnectionStatus, m1, m1 or '---').capitalize():<{col2}}{co} "
+                        f"{'XT60i Cable':<{col3}}: {m2 and (c or cm)}{get_enum_name(SolixConnectionStatus, m2, m2 or '---').capitalize()}{co}"
+                    )
+                m1 = cm and mqtt.get("device_1_output_power", "")
+                m2 = cm and str(mqtt.get("device_1_mode", ""))
+                if m1 or m2:
+                    CONSOLE.info(
+                        f"{'Dev 1 Power':<{col1}}: {m1 and (c or cm)}{m1 or '----':>4} {unit:<{col2 - 5}}{co} "
+                        f"{'Dev 1 Mode':<{col3}}: {m2 and (c or cm)}{get_enum_name(SolixPpsPortStatus, m2, m2 or '----').capitalize()}{co}"
+                    )
+                if (m1 := mqtt.get("device_1_sn")) is not None:
+                    m2 = cm and mqtt.get("device_1_soc", "")
+                    soc = f"{m2 or '---':>4} %"
+                    m3 = cm and mqtt.get("device_1_pn", "")
+                    m4 = cm and mqtt.get("device_1_temperature", "")
+                    if m4 and mqtt.get("temp_unit_fahrenheit"):
+                        m4 = f"{float(m4) * 9 / 5 + 32:>4} °F"
+                    else:
+                        m4 = f"{m4 or '---':>4} {'°F' if mqtt.get('temp_unit_fahrenheit') else '°C'}"
+                    CONSOLE.info(
+                        f"{('Dev 1   [' + (c or cm) + (m3 or '-----') + co + ']'):<{col1}}: {(c or cm)}{(m1 or '-' * 17):<{col2}}{co} "
+                        f"{'Dev 1 SoC / Tmp':<{col3}}: {(c or cm)}{soc} / {m4}{co}"
+                    )
+                if schedule := mqtt.get("custom_plan"):
+                    m1 = cm and schedule.get("custom_mode_switch", "")
+                    m2 = cm and str(schedule.get("weekdays", "")).replace(
+                        "'", ""
+                    ).replace(" ", "")
+                    CONSOLE.info(
+                        f"{'Cust. Mode Sw.':<{col1}}: {str(m1) and (c or cm)}{get_enum_name(SolixSwitchMode, m1, str(m1) or '---').upper():>3}{'':<{col2-3}}{co} "
+                        f"{'Weekdays':<{col3}}: {m2 and (c or cm)}{m2 or '---'}{co}"
+                    )
+                    for i, slot in enumerate(schedule.get("ranges",[]), start = 1):
+                        m1 = cm and str(slot.get("start_time", ""))
+                        m3 = cm and str(slot.get("end_time", ""))
+                        m2 = cm and str(slot.get("load_mode", ""))
+                        if m1 or m2:
+                            CONSOLE.info(
+                                f"{'Cust. Slot '+ str(i):<{col1}}: {m1 and (c or cm)}{m1 or '--:--'}{co} - {m3 and (c or cm)}{m3 or '--:--':<{col2 - 8}}{co} "
+                                f"{'Load mode '+ str(i):<{col3}}: {m2 and (c or cm)}{get_enum_name(SolixPpsLoadMode, m2, m2 or '---').title()}{co}"
+                            )
+                if schedule := mqtt.get("tou_plan"):
+                    for i, slot in enumerate(schedule.get("ranges",[]), start = 1):
+                        m1 = cm and str(slot.get("start_time", ""))
+                        m3 = cm and str(slot.get("end_time", ""))
+                        m2 = cm and str(slot.get("tariff", ""))
+                        if m1 or m2:
+                            CONSOLE.info(
+                                f"{'TOU Slot '+ str(i):<{col1}}: {m1 and (c or cm)}{m1 or '--:--'}{co} - {m3 and (c or cm)}{m3 or '--:--':<{col2 - 8}}{co} "
+                                f"{'Tariff '+ str(i):<{col3}}: {m2 and (c or cm)}{get_enum_name(SolixTariffTypes, int(m2) if m2.isdigit() else m2, m2 or '-').title().replace("_"," ")}{co}"
+                            )
+                m1 = cm and str(mqtt.get("silent_mode_start_minutes", ""))
+                m3 = cm and str(mqtt.get("silent_mode_end_minutes", ""))
+                if m1 or m3:
+                    if m1:
+                        m1 = f"{int(m1) // 60:02d}:{int(m1) % 60:02d}"
+                    if m3:
+                        m3 = f"{int(m3) // 60:02d}:{int(m3) % 60:02d}"
+                    m2 = cm and str(mqtt.get("silent_mode_weekdays", "")).replace(
+                        "'", ""
+                    ).replace(" ", "")
+                    m5 = cm and mqtt.get("silent_mode_switch", "")
+                    CONSOLE.info(
+                        f"{'Silent Mode':<{col1}}: {m1 and (c or cm)}{m1 or '--:--'}{co} - {m3 and (c or cm)}{m3 or '--:--'}{co} "
+                        f"{str(m5) and (c or cm)}({get_enum_name(SolixSwitchMode, m5, str(m5) or '---').upper():>3}{')':<{col2-18}}{co} "
+                        f"{'Weekdays':<{col3}}: {m2 and (c or cm)}{m2}{co}"
+                    )
+
+            else:
+                if "battery_capacity" in dev:
+                    CONSOLE.info(
+                        f"{'Capacity':<{col1}}: {cc}{customized.get('battery_capacity') or dev.get('battery_capacity', '----')!s:>4} {'Wh':<{col2 - 5}}{co} "
+                        f"{'Battery Count':<{col3}}: {dev.get('batCount') or 'Unknown'}"
+                    )
+                CONSOLE.warning(
+                    f"Further details for device type {str(devtype).capitalize()} are not supported"
+                )
+        # print optional user vehicles
+        if self.showVehicles and (vehicles := self.api.account.get("vehicles") or {}):
+            CONSOLE.info("=" * 80)
+            CONSOLE.info(
+                f"{Color.BLUE}Electric vehicle details for user '{self.api.account.get('nickname') or 'Unknown'}':{co}"
+            )
+            keys = set(vehicles.keys())
+            for vehicleid, vehicle in vehicles.items():
+                CONSOLE.info(
+                    f"{'EV Name':<{col1}}: {Color.BLUE}{vehicle.get('vehicle_name', 'Unknown')}{co}  (Vehicle ID: {vehicleid})"
+                )
+                ev = SolixVehicle(vehicle=vehicle)
+                CONSOLE.info(
+                    f"{'EV Brand':<{col1}}: {ev.brand or 'Unknown':<{col2}} "
+                    f"{'EV model':<{col3}}: {ev.model or 'Unknown'}"
+                )
+                CONSOLE.info(
+                    f"{'Consumption':<{col1}}: {(round(ev.energy_consumption_per_100km, 1) if ev.energy_consumption_per_100km else '--.-')!s:>4} {'kWh / 100 km':<{col2 - 5}} "
+                    f"{'EV Year':<{col3}}: {(ev.productive_year or '----')!s}"
+                )
+                CONSOLE.info(
+                    f"{'Charge Limit':<{col1}}: {(round(ev.ac_max_charging_power, 1) if ev.ac_max_charging_power else '--.-')!s:>4} {'kW':<{col2 - 5}} "
+                    f"{'Capacity':<{col3}}: {(round(ev.battery_capacity, 1) if ev.battery_capacity else '--.-')!s:>5} kWh"
+                )
+                CONSOLE.info(
+                    f"{'Is Charging':<{col1}}: {('YES' if vehicle.get('is_smart_charging') else 'NO'):<{col2}} "
+                    f"{'Is Default EV':<{col3}}: {('YES' if vehicle.get('is_default_vehicle') else 'NO')}"
+                )
+                keys.discard(vehicleid)
+                if keys:
+                    CONSOLE.info("-" * 80)
+        # print optional energy details
+        if self.energy_stats and not self.device_filter:
+            for site_id, site in [
+                (s, d)
+                for s, d in self.api.sites.items()
+                if (not self.site_selected or s == self.site_selected)
+            ]:
+                details = site.get("site_details") or {}
+                customized = site.get("customized") or {}
+                price = "--.--"
+                CONSOLE.info("=" * 80)
+                CONSOLE.info(
+                    f"{Color.CYAN}Energy details for System {(site.get('site_info') or {}).get('site_name', 'Unknown')} (Site ID: {site_id}):{co}"
+                )
+                if len(totals := site.get("statistics") or []) >= 3:
+                    CONSOLE.info(
+                        f"{'Total Produced':<{col1}}: {totals[0].get('total', '---.--'):>6} {str(totals[0].get('unit', '')).upper():<{col2 - 8}}  "
+                        f"{'Carbon Saved':<{col3}}: {totals[1].get('total', '---.--'):>6} {str(totals[1].get('unit', '')).upper()}"
+                    )
+                    if co2 := details.get("co2_ranking") or {}:
+                        CONSOLE.info(
+                            f"{'CO2 Ranking':<{col1}}: {co2.get('ranking') or '----':>6} {'(' + str(co2.get('tree') or '--.-') + ' Trees)':<{col2 - 8}}  "
+                            f"{'Message':<{col3}}: {co2.get('content')}"
+                        )
+                    price = (
+                        f"{float(price):.2f}"
+                        if (price := str(details.get("price")))
+                        .replace("-", "", 1)
+                        .replace(".", "", 1)
+                        .isdigit()
+                        else "--.--"
+                    )
+                    unit = details.get("site_price_unit") or ""
+                    CONSOLE.info(
+                        f"{'Max Savings':<{col1}}: {totals[2].get('total', '---.--'):>6} {totals[2].get('unit', ''):<{col2 - 8}}  "
+                        f"{'Price kWh':<{col3}}: {price:>6} {unit} (Fix)"
+                    )
+                if ai_profits := site.get("aiems_profit"):
+                    unit = ai_profits.get("unit") or ""
+                    CONSOLE.info(
+                        f"{'AI Savings':<{col1}}: {ai_profits.get('aiems_profit_total', '---.--'):>6} {unit:<{col2 - 8}}  "
+                        f"{'AI Advantage':<{col3}}: {ai_profits.get('aiems_self_use_diff', '---.--'):>6} {unit} ({ai_profits.get('percentage', '---.--')} %)"
+                    )
+                price_type = details.get("price_type") or ""
+                dynamic = (
+                    details.get("dynamic_price")
+                    or customized.get("dynamic_price")
+                    or {}
+                )
+                dyn_details = details.get("dynamic_price_details") or {}
+                provider = SolixPriceProvider(provider=dynamic)
+                if price_type or dynamic:
+                    dyn_price = None
+                    dyn_unit = None
+                    if price_type == SolixPriceTypes.DYNAMIC.value or dynamic:
+                        dyn_price = (
+                            f"{float(price):.2f}"
+                            if (price := dyn_details.get("dynamic_price_total") or "")
+                            .replace("-", "", 1)
+                            .replace(".", "", 1)
+                            .isdigit()
+                            else "--.--"
+                        )
+                        dyn_unit = dyn_details.get("spot_price_unit") or ""
+                    elif price_type == SolixPriceTypes.USE_TIME.value and (
+                        dev := self.api.devices.get(
+                            (
+                                next(
+                                    iter(
+                                        (site.get("solarbank_info") or {}).get(
+                                            "solarbank_list"
+                                        )
+                                        or [{}]
+                                    ),
+                                    {},
+                                )
+                            ).get("device_sn")
+                            or ""
+                        )
+                    ):
+                        dyn_price = (
+                            f"{float(price):.2f}"
+                            if (price := dev.get("preset_tariff_price") or "")
+                            .replace("-", "", 1)
+                            .replace(".", "", 1)
+                            .isdigit()
+                            else "---.--"
+                        )
+                        dyn_unit = dev.get("preset_tariff_currency")
+                    CONSOLE.info(
+                        f"{'Active Price':<{col1}}: {dyn_price or price:>6} {(dyn_unit or unit) + ' (' + (price_type.capitalize() or '------') + ')':<{col2 - 7}} "
+                        f"{'Price Provider':<{col3}}: {provider!s}"
+                    )
+                    if (spot := dyn_details.get("spot_price_mwh")) is not None:
+                        spot = (
+                            f"{float(price):.2f}"
+                            if (price := spot)
+                            .replace("-", "", 1)
+                            .replace(".", "", 1)
+                            .isdigit()
+                            else "---.--"
+                        )
+                        today = (
+                            f"{float(price):.2f}"
+                            if (
+                                price := dyn_details.get("spot_price_mwh_avg_today")
+                                or ""
+                            )
+                            .replace("-", "", 1)
+                            .replace(".", "", 1)
+                            .isdigit()
+                            else "---.--"
+                        )
+                        tomorrow = (
+                            f"{float(price):.2f}"
+                            if (
+                                price := dyn_details.get("spot_price_mwh_avg_tomorrow")
+                                or ""
+                            )
+                            .replace("-", "", 1)
+                            .replace(".", "", 1)
+                            .isdigit()
+                            else "---.--"
+                        )
+                        unit = dyn_details.get("spot_price_unit") or ""
+                        time = str(dyn_details.get("spot_price_time") or "")[-5:]
+                        CONSOLE.info(
+                            f"{'Spot Price':<{col1}}: {spot:>6} {unit + '/MWh (' + (time or '--:--') + ')':<{col2 - 7}} "
+                            f"{'Avg today/tomor':<{col3}}: {today:>6} / {tomorrow:>6} {unit + '/MWh'}"
+                        )
+
+                        CONSOLE.info(
+                            f"{'Price Fee':<{col1}}: {dyn_details.get('dynamic_price_fee') or '-.----':>8} {unit:<{col2 - 9}} "
+                            f"{'Price VAT':<{col3}}: {dyn_details.get('dynamic_price_vat') or '--.--':>6} %"
+                        )
+                        CONSOLE.info(
+                            f"{'Poll Time':<{col1}}: {dyn_details.get('dynamic_price_poll_time') or '':<{col2}} "
+                            f"{'Calc Time':<{col3}}: {dyn_details.get('dynamic_price_calc_time') or ''}"
+                        )
+                if energy := site.get("energy_details") or {}:
+                    today: dict = energy.get("today") or {}
+                    yesterday: dict = energy.get("last_period") or {}
+                    forecast: dict = energy.get("pv_forecast_details") or {}
+                    dev_energies = {
+                        f"{'..' + sn[-12:]}": d.get("energy_details")
+                        for sn, d in self.api.devices.items()
+                        if d.get("site_id") == site_id and d.get("energy_details")
+                    }
+                    unit = "kWh"
+                    if value := forecast.get("forecast_24h"):
+                        CONSOLE.info(
+                            f"{'PV Trend 24h':<{col1}}: {value or '-.--':>6} {unit:<{col2 - 7}} "
+                            f"{'Local Time':<{col3}}: {forecast.get('local_time') or ''}"
+                        )
+                        u = (forecast.get("trend_unit") or "").capitalize()
+                        thishour = forecast.get("trend_this_hour") or ""
+                        if "k" not in u.lower():
+                            thishour = (
+                                f"{float(thishour):.0f}"
+                                if str(thishour)
+                                .replace(".", "", 1)
+                                .replace("-", "", 1)
+                                .isdigit()
+                                else ""
+                            )
+                        nexthour = forecast.get("trend_next_hour") or ""
+                        if "k" not in u.lower():
+                            nexthour = (
+                                f"{float(nexthour):.0f}"
+                                if str(nexthour)
+                                .replace(".", "", 1)
+                                .replace("-", "", 1)
+                                .isdigit()
+                                else ""
+                            )
+                        CONSOLE.info(
+                            f"{'PV This/Next h':<{col1}}: {thishour or '-----':>6} / {nexthour or '-----':>5} {u:<{col2 - 15}} "
+                            f"{'Trend Poll Time':<{col3}}: {forecast.get('poll_time') or ''}  {'(' + str(forecast.get('time_this_hour') or '--:--')[-5:] + ')'}"
+                        )
+                        CONSOLE.info(
+                            f"{'PV Trend Today':<{col1}}: {forecast.get('forecast_today') or '-.--':>6} {unit:<{col2 - 7}} "
+                            f"{'PV Trend Tomor.':<{col3}}: {forecast.get('forecast_tomorrow') or '-.--':>6} {unit}"
+                        )
+                        CONSOLE.info(
+                            f"{'Produced Today':<{col1}}: {forecast.get('produced_today') or '-.--':>6} {unit:<{col2 - 7}} "
+                            f"{'Remain Today':<{col3}}: {forecast.get('remaining_today') or '-.--':>6} {unit}"
+                        )
+                    CONSOLE.info("-" * 80)
+                    CONSOLE.info(
+                        f"{'Today':<{col1}}: {today.get('date', '----------'):<{col2}} "
+                        f"{'Yesterday':<{col3}}: {yesterday.get('date', '----------')!s}"
+                    )
+                    if m1 := c and mqtt.get("pv_yield_today", ""):
+                        m1 = f"{float(m1):.2f}"
+                    if value := today.get("solar_production") or m1:
+                        CONSOLE.info(
+                            f"{'Solar Energy':<{col1}}: {m1 and c}{m1 or value or '-.--':>6} {unit:<{col2 - 7}}{co} "
+                            f"{'Solar Energy':<{col3}}: {yesterday.get('solar_production') or '-.--':>6} {unit}"
+                        )
+                        for key, item in dev_energies.items():
+                            if t := (item.get("today") or {}).get("solar_production"):
+                                y = (item.get("last_period") or {}).get(
+                                    "solar_production"
+                                )
+                                CONSOLE.info(
+                                    f"{'-' + key:<{col1}}: {t or '-.--':>6} {unit:<{col2 - 7}} "
+                                    f"{'-' + key:<{col3}}: {y or '-.--':>6} {unit}"
+                                )
+                    if value := today.get("solar_production_pv1"):
+                        CONSOLE.info(
+                            f"{'Solar Ch 1/2':<{col1}}: {value or '-.--':>6} / {today.get('solar_production_pv2') or '-.--':>5} {unit:<{col2 - 15}} "
+                            f"{'Solar Ch 1/2':<{col3}}: {yesterday.get('solar_production_pv1') or '-.--':>6} / {yesterday.get('solar_production_pv2') or '-.--':>5} {unit}"
+                        )
+                    if value := today.get("solar_production_pv3"):
+                        CONSOLE.info(
+                            f"{'Solar Ch 3/4':<{col1}}: {value or '-.--':>6} / {today.get('solar_production_pv4') or '-.--':>5} {unit:<{col2 - 15}} "
+                            f"{'Solar Ch 3/4':<{col3}}: {yesterday.get('solar_production_pv3') or '-.--':>6} / {yesterday.get('solar_production_pv4') or '-.--':>5} {unit}"
+                        )
+                    if value := today.get("solar_production_microinverter"):
+                        CONSOLE.info(
+                            f"{'Solar Ch AC':<{col1}}: {value or '-.--':>6} {unit:<{col2 - 7}} "
+                            f"{'Solar Ch AC':<{col3}}: {yesterday.get('solar_production_microinverter') or '-.--':>6} {unit}"
+                        )
+                    if m1 := c and mqtt.get("charged_energy_today", ""):
+                        m1 = f"{float(m1):.2f}"
+                    if value := today.get("battery_charge") or m1:
+                        CONSOLE.info(
+                            f"{'Charged':<{col1}}: {m1 and c}{m1 or value or '-.--':>6} {unit:<{col2 - 7}}{co} "
+                            f"{'Charged':<{col3}}: {yesterday.get('battery_charge') or '-.--':>6} {unit}"
+                        )
+                        for key, item in dev_energies.items():
+                            if t := (item.get("today") or {}).get("battery_charge"):
+                                y = (item.get("last_period") or {}).get(
+                                    "battery_charge"
+                                )
+                                CONSOLE.info(
+                                    f"{'-' + key:<{col1}}: {t or '-.--':>6} {unit:<{col2 - 7}} "
+                                    f"{'-' + key:<{col3}}: {y or '-.--':>6} {unit}"
+                                )
+                    if m1 := c and mqtt.get("pv_charge_today", ""):
+                        m1 = f"{float(m1):.2f}"
+                    if value := today.get("solar_to_battery") or m1:
+                        CONSOLE.info(
+                            f"{'Charged Solar':<{col1}}: {m1 and c}{m1 or value or '-.--':>6} {unit:<{col2 - 7}}{co} "
+                            f"{'Charged Solar':<{col3}}: {yesterday.get('solar_to_battery') or '-.--':>6} {unit}"
+                        )
+                        for key, item in dev_energies.items():
+                            if t := (item.get("today") or {}).get("solar_to_battery"):
+                                y = (item.get("last_period") or {}).get(
+                                    "solar_to_battery"
+                                )
+                                CONSOLE.info(
+                                    f"{'-' + key:<{col1}}: {t or '-.--':>6} {unit:<{col2 - 7}} "
+                                    f"{'-' + key:<{col3}}: {y or '-.--':>6} {unit}"
+                                )
+                    if m1 := c and mqtt.get("grid_charged_today", ""):
+                        m1 = f"{float(m1):.2f}"
+                    if value := today.get("grid_to_battery") or m1:
+                        CONSOLE.info(
+                            f"{'Charged Grid':<{col1}}: {m1 and c}{m1 or value or '-.--':>6} {unit:<{col2 - 7}}{co} "
+                            f"{'Charged Grid':<{col3}}: {yesterday.get('grid_to_battery') or '-.--':>6} {unit}"
+                        )
+                        for key, item in dev_energies.items():
+                            if t := (item.get("today") or {}).get("grid_to_battery"):
+                                y = (item.get("last_period") or {}).get(
+                                    "grid_to_battery"
+                                )
+                                CONSOLE.info(
+                                    f"{'-' + key:<{col1}}: {t or '-.--':>6} {unit:<{col2 - 7}} "
+                                    f"{'-' + key:<{col3}}: {y or '-.--':>6} {unit}"
+                                )
+                    if m1 := c and mqtt.get("grid_discharged_today", ""):
+                        m1 = f"{float(m1):.2f}"
+                    if value := today.get("battery_to_grid") or m1:
+                        CONSOLE.info(
+                            f"{'Discharged Grid':<{col1}}: {m1 and c}{m1 or value or '-.--':>6} {unit:<{col2 - 7}}{co} "
+                            f"{'Discharged Grid':<{col3}}: {yesterday.get('battery_to_grid') or '-.--':>6} {unit}"
+                        )
+                        for key, item in dev_energies.items():
+                            if t := (item.get("today") or {}).get("grid_to_battery"):
+                                y = (item.get("last_period") or {}).get(
+                                    "grid_to_battery"
+                                )
+                                CONSOLE.info(
+                                    f"{'-' + key:<{col1}}: {t or '-.--':>6} {unit:<{col2 - 7}} "
+                                    f"{'-' + key:<{col3}}: {y or '-.--':>6} {unit}"
+                                )
+                    if value := today.get("3rd_party_pv_to_bat"):
+                        CONSOLE.info(
+                            f"{'Charged Ext PV':<{col1}}: {value or '-.--':>6} {unit:<{col2 - 7}} "
+                            f"{'Charged Ext PV':<{col3}}: {yesterday.get('3rd_party_pv_to_bat') or '-.--':>6} {unit}"
+                        )
+                        for key, item in dev_energies.items():
+                            if t := (item.get("today") or {}).get(
+                                "3rd_party_pv_to_bat"
+                            ):
+                                y = (item.get("last_period") or {}).get(
+                                    "3rd_party_pv_to_bat"
+                                )
+                                CONSOLE.info(
+                                    f"{'-' + key:<{col1}}: {t or '-.--':>6} {unit:<{col2 - 7}} "
+                                    f"{'-' + key:<{col3}}: {y or '-.--':>6} {unit}"
+                                )
+                    if m1 := c and mqtt.get("discharged_energy_today", ""):
+                        m1 = f"{float(m1):.2f}"
+                    if value := today.get("battery_discharge") or m1:
+                        CONSOLE.info(
+                            f"{'Discharged':<{col1}}: {m1 and c}{m1 or value or '-.--':>6} {unit:<{col2 - 7}}{co} "
+                            f"{'Discharged':<{col3}}: {yesterday.get('battery_discharge') or '-.--':>6} {unit}"
+                        )
+                        for key, item in dev_energies.items():
+                            if t := (item.get("today") or {}).get("battery_discharge"):
+                                y = (item.get("last_period") or {}).get(
+                                    "battery_discharge"
+                                )
+                                CONSOLE.info(
+                                    f"{'-' + key:<{col1}}: {t or '-.--':>6} {unit:<{col2 - 7}} "
+                                    f"{'-' + key:<{col3}}: {y or '-.--':>6} {unit}"
+                                )
+                    if m1 := c and mqtt.get("home_consumption_today", ""):
+                        m1 = f"{float(m1):.2f}"
+                    if value := today.get("home_usage") or m1:
+                        CONSOLE.info(
+                            f"{'House Usage':<{col1}}: {m1 and c}{m1 or value or '-.--':>6} {unit:<{col2 - 7}}{co} "
+                            f"{'House Usage':<{col3}}: {yesterday.get('home_usage') or '-.--':>6} {unit}"
+                        )
+                        for key, item in dev_energies.items():
+                            if t := (item.get("today") or {}).get("home_usage"):
+                                y = (item.get("last_period") or {}).get("home_usage")
+                                CONSOLE.info(
+                                    f"{'-' + key:<{col1}}: {t or '-.--':>6} {unit:<{col2 - 7}} "
+                                    f"{'-' + key:<{col3}}: {y or '-.--':>6} {unit}"
+                                )
+                    if m1 := c and mqtt.get("pv_consumption_today", ""):
+                        m1 = f"{float(m1):.2f}"
+                    if value := today.get("solar_to_home") or m1:
+                        CONSOLE.info(
+                            f"{'Solar Usage':<{col1}}: {m1 and c}{m1 or value or '-.--':>6} {unit:<{col2 - 7}}{co} "
+                            f"{'Solar Usage':<{col3}}: {yesterday.get('solar_to_home') or '-.--':>6} {unit}"
+                        )
+                        for key, item in dev_energies.items():
+                            if t := (item.get("today") or {}).get("solar_to_home"):
+                                y = (item.get("last_period") or {}).get("solar_to_home")
+                                CONSOLE.info(
+                                    f"{'-' + key:<{col1}}: {t or '-.--':>6} {unit:<{col2 - 7}} "
+                                    f"{'-' + key:<{col3}}: {y or '-.--':>6} {unit}"
+                                )
+                    if m1 := c and mqtt.get("battery_consumption_today", ""):
+                        m1 = f"{float(m1):.2f}"
+                    if value := today.get("battery_to_home") or m1:
+                        CONSOLE.info(
+                            f"{'Battery Usage':<{col1}}: {m1 and c}{m1 or value or '-.--':>6} {unit:<{col2 - 7}}{co} "
+                            f"{'Battery Usage':<{col3}}: {yesterday.get('battery_to_home') or '-.--':>6} {unit}"
+                        )
+                        for key, item in dev_energies.items():
+                            if t := (item.get("today") or {}).get("battery_to_home"):
+                                y = (item.get("last_period") or {}).get(
+                                    "battery_to_home"
+                                )
+                                CONSOLE.info(
+                                    f"{'-' + key:<{col1}}: {t or '-.--':>6} {unit:<{col2 - 7}} "
+                                    f"{'-' + key:<{col3}}: {y or '-.--':>6} {unit}"
+                                )
+                    if value := today.get("ev_charge") or m1:
+                        CONSOLE.info(
+                            f"{'EV Charge Usage':<{col1}}: {m1 and c}{m1 or value or '-.--':>6} {unit:<{col2 - 7}}{co} "
+                            f"{'EV Charge Usage':<{col3}}: {yesterday.get('ev_charge') or '-.--':>6} {unit}"
+                        )
+                        for key, item in dev_energies.items():
+                            if t := (item.get("today") or {}).get("ev_charge"):
+                                y = (item.get("last_period") or {}).get("ev_charge")
+                                CONSOLE.info(
+                                    f"{'-' + key:<{col1}}: {t or '-.--':>6} {unit:<{col2 - 7}} "
+                                    f"{'-' + key:<{col3}}: {y or '-.--':>6} {unit}"
+                                )
+                    if m1 := c and mqtt.get("grid_consumption_today", ""):
+                        m1 = f"{float(m1):.2f}"
+                    if value := today.get("grid_to_home") or m1:
+                        CONSOLE.info(
+                            f"{'Grid Usage':<{col1}}: {m1 and c}{m1 or value or '-.--':>6} {unit:<{col2 - 7}}{co} "
+                            f"{'Grid Usage':<{col3}}: {yesterday.get('grid_to_home') or '-.--':>6} {unit}"
+                        )
+                        for key, item in dev_energies.items():
+                            if t := (item.get("today") or {}).get("grid_to_home"):
+                                y = (item.get("last_period") or {}).get("grid_to_home")
+                                CONSOLE.info(
+                                    f"{'-' + key:<{col1}}: {t or '-.--':>6} {unit:<{col2 - 7}} "
+                                    f"{'-' + key:<{col3}}: {y or '-.--':>6} {unit}"
+                                )
+                    if m1 := c and mqtt.get("grid_import_today", ""):
+                        m1 = f"{float(m1):.2f}"
+                    if value := today.get("grid_import") or m1:
+                        CONSOLE.info(
+                            f"{'Grid Import':<{col1}}: {m1 and c}{m1 or value or '-.--':>6} {unit:<{col2 - 7}}{co} "
+                            f"{'Grid Import':<{col3}}: {yesterday.get('grid_import') or '-.--':>6} {unit}"
+                        )
+                        for key, item in dev_energies.items():
+                            if t := (item.get("today") or {}).get("grid_import"):
+                                y = (item.get("last_period") or {}).get("grid_import")
+                                CONSOLE.info(
+                                    f"{'-' + key:<{col1}}: {t or '-.--':>6} {unit:<{col2 - 7}} "
+                                    f"{'-' + key:<{col3}}: {y or '-.--':>6} {unit}"
+                                )
+                    if m1 := c and mqtt.get("grid_export_today", ""):
+                        m1 = f"{float(m1):.2f}"
+                    if value := today.get("grid_export") or m1:
+                        CONSOLE.info(
+                            f"{'Grid Export':<{col1}}: {m1 and c}{m1 or value or '-.--':>6} {unit:<{col2 - 7}}{co} "
+                            f"{'Grid Export':<{col3}}: {yesterday.get('grid_export') or '-.--':>6} {unit}"
+                        )
+                        for key, item in dev_energies.items():
+                            if t := (item.get("today") or {}).get("grid_export"):
+                                y = (item.get("last_period") or {}).get("grid_export")
+                                CONSOLE.info(
+                                    f"{'-' + key:<{col1}}: {t or '-.--':>6} {unit:<{col2 - 7}} "
+                                    f"{'-' + key:<{col3}}: {y or '-.--':>6} {unit}"
+                                )
+                    if m1 := c and mqtt.get("pv_export_today", ""):
+                        m1 = f"{float(m1):.2f}"
+                    if value := today.get("solar_to_grid") or m1:
+                        CONSOLE.info(
+                            f"{'Solar Export':<{col1}}: {m1 and c}{m1 or value or '-.--':>6} {unit:<{col2 - 7}}{co} "
+                            f"{'Solar Export':<{col3}}: {yesterday.get('solar_to_grid') or '-.--':>6} {unit}"
+                        )
+                        for key, item in dev_energies.items():
+                            if t := (item.get("today") or {}).get("solar_to_grid"):
+                                y = (item.get("last_period") or {}).get("solar_to_grid")
+                                CONSOLE.info(
+                                    f"{'-' + key:<{col1}}: {t or '-.--':>6} {unit:<{col2 - 7}} "
+                                    f"{'-' + key:<{col3}}: {y or '-.--':>6} {unit}"
+                                )
+                    if value := today.get("3rd_party_pv_to_grid"):
+                        CONSOLE.info(
+                            f"{'Ext PV Export':<{col1}}: {value or '-.--':>6} {unit:<{col2 - 7}} "
+                            f"{'Ext PV Export':<{col3}}: {yesterday.get('3rd_party_pv_to_grid') or '-.--':>6} {unit}"
+                        )
+                        for key, item in dev_energies.items():
+                            if t := (item.get("today") or {}).get(
+                                "3rd_party_pv_to_grid"
+                            ):
+                                y = (item.get("last_period") or {}).get(
+                                    "3rd_party_pv_to_grid"
+                                )
+                                CONSOLE.info(
+                                    f"{'-' + key:<{col1}}: {t or '-.--':>6} {unit:<{col2 - 7}} "
+                                    f"{'-' + key:<{col3}}: {y or '-.--':>6} {unit}"
+                                )
+                    if m1 := c and mqtt.get("generator_energy_today", ""):
+                        m1 = f"{float(m1):.2f}"
+                    if value := today.get("generator_energy") or m1:
+                        CONSOLE.info(
+                            f"{'Generator Prod':<{col1}}: {m1 and c}{m1 or value or '-.--':>6} {unit:<{col2 - 7}}{co} "
+                            f"{'Generator Prod':<{col3}}: {yesterday.get('generator_energy') or '-.--':>6} {unit}"
+                        )
+                    if m1 := c and mqtt.get("generator_charged_today", ""):
+                        m1 = f"{float(m1):.2f}"
+                    if value := today.get("generator_to_battery") or m1:
+                        CONSOLE.info(
+                            f"{'Generator Batt':<{col1}}: {m1 and c}{m1 or value or '-.--':>6} {unit:<{col2 - 7}}{co} "
+                            f"{'Generator Batt':<{col3}}: {yesterday.get('generator_to_battery') or '-.--':>6} {unit}"
+                        )
+                    if m1 := c and mqtt.get("generator_consumed_today", ""):
+                        m1 = f"{float(m1):.2f}"
+                    if value := today.get("generator_to_home") or m1:
+                        CONSOLE.info(
+                            f"{'Generator Home':<{col1}}: {m1 and c}{m1 or value or '-.--':>6} {unit:<{col2 - 7}}{co} "
+                            f"{'Generator Home':<{col3}}: {yesterday.get('generator_to_home') or '-.--':>6} {unit}"
+                        )
+                    if value := today.get("ac_socket"):
+                        CONSOLE.info(
+                            f"{'AC Socket':<{col1}}: {value or '-.--':>6} {unit:<{col2 - 7}} "
+                            f"{'AC Socket':<{col3}}: {yesterday.get('ac_socket') or '-.--':>6} {unit}"
+                        )
+                    if value := today.get("smartplugs_total"):
+                        CONSOLE.info(
+                            f"{'Smartplugs':<{col1}}: {value or '-.--':>6} {unit:<{col2 - 7}} "
+                            f"{'Smartplugs':<{col3}}: {yesterday.get('smartplugs_total') or '-.--':>6} {unit}"
+                        )
+                    for idx, plug_t in enumerate(today.get("smartplug_list") or []):
+                        plug_y = (yesterday.get("smartplug_list") or [])[idx]
+                        CONSOLE.info(
+                            f"{'-' + plug_t.get('alias', 'Plug ' + str(idx + 1)):<{col1}}: {plug_t.get('energy') or '-.--':>6} {unit:<{col2 - 7}} "
+                            f"{'-' + plug_y.get('alias', 'Plug ' + str(idx + 1)):<{col3}}: {plug_y.get('energy') or '-.--':>6} {unit}"
+                        )
+                    if value := today.get("solar_percentage"):
+                        CONSOLE.info(
+                            f"{'Sol/Bat/Gri %':<{col1}}: {float(value or '0') * 100:>3.0f}/{float(today.get('battery_percentage') or '0') * 100:>3.0f}/{float(today.get('other_percentage') or '0') * 100:>3.0f} {'%':<{col2 - 12}} "
+                            f"{'Sol/Bat/Gri %':<{col3}}: {float(yesterday.get('solar_percentage') or '0') * 100:>3.0f}/{float(yesterday.get('battery_percentage') or '0') * 100:>3.0f}/{float(yesterday.get('other_percentage') or '0') * 100:>3.0f} %"
+                        )
+        CONSOLE.info("=" * 80)
+        # Print MQTT stats if session active
+        if self.api.mqttsession:
+            if self.use_file:
+                if self.folderdict.get("steps") is None:
+                    CONSOLE.info(
+                        f"Active MQTT speed: {Color.CYAN}{self.folderdict.get('speed', 1):.2f}{co}, Message cycle duration: {Color.CYAN}"
+                        f"{self.folderdict.get('duration', 0) / self.folderdict.get('speed', 1):.0f} sec ({self.folderdict.get('progress', 0):6.2f} %){Color.OFF}, "
+                        f"Timestamp cycle: {Color.CYAN}{self.folderdict.get('ts_index', 0) + 1:3d} / {self.folderdict.get('timestamps', 0):3d}{Color.OFF}, "
+                        f"Timestamp: {Color.CYAN}{datetime.fromtimestamp(self.folderdict.get('timestamp', 0)).strftime('%Y-%m-%d %H:%M:%S')}{Color.OFF}"
+                    )
+                else:
+                    CONSOLE.info(
+                        f"MQTT step mode: {Color.YELLOW}{self.folderdict.get('progress', 0):6.2f} %{Color.OFF}, "
+                        f"Timestamp cycle: {Color.YELLOW}{self.folderdict.get('ts_index', 0) + 1:3d} / {self.folderdict.get('timestamps', 0):3d}{Color.OFF}, "
+                        f"Timestamp: {Color.YELLOW}{datetime.fromtimestamp(self.folderdict.get('timestamp', 0)).strftime('%Y-%m-%d %H:%M:%S')}{Color.OFF}"
+                    )
+            else:
+                trigger_sec = (
+                    int((self.triggered - datetime.now()).total_seconds())
+                    if self.triggered
+                    else None
+                )
+                CONSOLE.info(
+                    f"Active MQTT topics: {Color.GREEN}{str(self.api.mqttsession.subscriptions or ' None ')[1:-1]}{co}"
+                )
+                CONSOLE.info(
+                    f"Realtime Triggered: {Color.GREEN + str(trigger_sec) + ' sec' if self.triggered is not None else Color.RED + 'OFF'}{co}, "
+                    f"Devices: {Color.CYAN + str(self.api.mqttsession.triggered_devices or ' None ')[1:-1]}{co}"
+                )
+            CONSOLE.info(f"MQTT {self.api.mqttsession.mqtt_stats!s}")
+        # clear any delayed refresh and print key options
+        #self.delayed_sn_refresh.clear()
+        #self.get_menu_options()
+
+    async def async_inupt(self, prompt: str) -> str:
+        """Get interruptable intput without blocking the event loop."""
+        result = None
+        self.input_task = self.loop.create_task(asyncio.to_thread(input, prompt))
+        await self.input_task
+        result = self.input_task.result()
+        self.input_task = None
+        return result
+
+    async def wait_until_next_refresh(self) -> None:
+        """Wait until the next API refresh is due without blocking the event loop."""
+        while datetime.now().astimezone() < self.next_refr:
+            await asyncio.sleep(0.5)
+    
+    async def main(self) -> None:  # noqa: C901
+        """Run Main routine to start the monitor in a loop."""
+        # pylint: disable=logging-fstring-interpolation
+        # get running loop to run blocking code
+        self.loop = asyncio.get_running_loop()
+        CONSOLE.info("Anker Solix Monitor:")
+        # get list of possible example and export folders to test the monitor against
+        exampleslist: list = self.get_subfolders(
+            Path(__file__).parent / "examples"
+        ) + self.get_subfolders(Path(__file__).parent / "exports")
+        # interval count for details refresh
+        details_refresh: int = 10
+        if self.interactive:
+            if exampleslist:
+                exampleslist.sort()
+                CONSOLE.info("\nSelect the input source for the monitor:")
+                CONSOLE.info(f"({Color.CYAN}0{Color.OFF}) Real time from Anker cloud")
+                for idx, filename in enumerate(exampleslist, start=1):
+                    CONSOLE.info(f"({Color.YELLOW}{idx}{Color.OFF}) {filename}")
+                CONSOLE.info(f"({Color.RED}Q{Color.OFF}) Quit")
+            selection = await self.async_inupt(
+                f"Input Source number {Color.CYAN}0{Color.YELLOW}-{len(exampleslist)}{Color.OFF}) or [{Color.RED}Q{Color.OFF}]uit: ",
+            )
+            if (
+                selection is None
+                or selection.upper() in ["Q", "QUIT"]
+                or not selection.isdigit()
+                or int(selection) < 0
+                or int(selection) > len(exampleslist)
+            ):
+                return False
+            if (folderselection := int(selection)) == 0:
+                self.use_file = False
+            else:
+                self.use_file = True
+                self.folderdict["folder"] = exampleslist[folderselection - 1]
+        else:
+            self.use_file = False
+        try:
+            async with ClientSession() as websession:
+                user = "" if self.use_file else common.user()
+                if not self.use_file:
+                    CONSOLE.info("Trying Api authentication for user %s...", user)
+
+                # Create a logger for the API with appropriate level
+                if self.debug_http:
+                    api_logger = CONSOLE
+                else:
+                    # Create a logger that suppresses DEBUG messages
+                    api_logger = logging.getLogger(f"{__name__}.api")
+                    api_logger.setLevel(logging.INFO)
+                    # Add the same handler as CONSOLE but with INFO level
+                    handler = logging.StreamHandler()
+                    handler.setLevel(logging.INFO)
+                    handler.setFormatter(logging.Formatter("%(message)s"))
+                    api_logger.addHandler(handler)
+                    api_logger.propagate = False
+
+                self.api = AnkerSolixApi(
+                    user,
+                    "" if self.use_file else common.password(),
+                    "" if self.use_file else common.country(),
+                    websession,
+                    api_logger,
+                )
+                if self.use_file:
+                    # set the correct test folder for Api
+                    self.api.testDir(self.folderdict.get("folder"))
+                elif await self.api.async_authenticate():
+                    CONSOLE.info(
+                        f"Anker Cloud authentication: {Color.GREEN}OK{Color.OFF}"
+                    )
+                else:
+                    # Login validation will be done during first API call
+                    CONSOLE.info(
+                        f"Anker Cloud authentication: {Color.CYAN}CACHED{Color.OFF}"
+                    )
+                # Start continuous JSONL storage
+                self.storage_task = self.loop.create_task(self.storage_loop())
+
+                # Start optional static webserver
+                await self.start_webserver()
+                if self.interactive:
+                    while True:
+                        resp = await self.async_inupt(
+                            f"How many seconds refresh interval should be used? ({Color.YELLOW}5-600{Color.OFF}, default: {Color.CYAN}30{Color.OFF}): ",
+                        )
+                        if not resp:
+                            self.refresh_interval = 30
+                            break
+                        if resp.isdigit() and 5 <= int(resp) <= 600:
+                            self.refresh_interval = int(resp)
+                            break
+
+                    # ask for including energy details
+                    while True:
+                        resp = await self.async_inupt(
+                            f"Do you want to include daily site energy statistics? ([{Color.YELLOW}Y{Color.OFF}]es / [{Color.CYAN}N{Color.OFF}]o = default): ",
+                        )
+                        if not resp or resp.upper() in ["N", "NO"]:
+                            break
+                        if resp.upper() in ["Y", "YES"]:
+                            self.energy_stats = True
+                            break
+
+                # Run loop to update Solarbank parameters
+                self.next_refr = datetime.now().astimezone()
+                self.next_dev_refr = 0
+                site_names: list | None = None
+                startup: bool = True
+                deferred: bool = False
+                mqtt_task: asyncio.Task | None = None
+                while True:
+                  try:
+                    now = datetime.now().astimezone()
+
+                    if self.api_backoff_until and now < self.api_backoff_until:
+                        await self.wait_until_next_refresh()
+                        continue
+
+                    self.api_backoff_until = None
+
+                    if self.next_refr <= now:
+                        # Ask whether monitor should be limited to selected site ID
+                        if not site_names:
+                            CONSOLE.info("Getting site list...")
+                            sites = (
+                                await self.api.get_site_list(fromFile=self.use_file)
+                            ).get("site_list") or []
+                            site_names = ["All"] + [
+                                (
+                                    ", ".join(
+                                        [
+                                            str(s.get("site_id")),
+                                            str(s.get("site_name")),
+                                            f"Type: {((t := s.get('power_site_type')) or 'unknown')!s} ({getattr(SolixSiteType, 't_' + str(t), 'unknown')})",
+                                        ]
+                                    )
+                                )
+                                for s in sites
+                            ]
+                            if self.interactive and len(site_names) > 2:
+                                CONSOLE.info("Select which Site to be monitored:")
+                                for idx, sitename in enumerate(site_names):
+                                    CONSOLE.info(
+                                        f"({Color.YELLOW}{idx}{Color.OFF}) {sitename}"
+                                    )
+                                selection = await self.async_inupt(
+                                    f"Enter site number ({Color.YELLOW}0-{len(site_names) - 1}{Color.OFF}) or nothing for {Color.CYAN}All{Color.OFF}: ",
+                                )
+                                if (
+                                    selection
+                                    and selection.isdigit()
+                                    and 1 <= int(selection) < len(site_names)
+                                ):
+                                    self.site_selected = site_names[
+                                        int(selection)
+                                    ].split(",", maxsplit=1)[0]
+                        if not (self.use_file or site_names):
+                            # ask which endpoint limit should be applied or use command line arg
+                            if self.interactive:
+                                selection = await self.async_inupt(
+                                    f"Enter Api endpoint limit for request throttling ({Color.YELLOW}1-50, 0 = disabled{Color.OFF}) "
+                                    f"[Default: {Color.CYAN}{self.api.apisession.endpointLimit()}{Color.OFF}]: ",
+                                )
+                                if (
+                                    selection
+                                    and selection.isdigit()
+                                    and 0 <= int(selection) <= 50
+                                ):
+                                    self.api.apisession.endpointLimit(int(selection))
+                            else:
+                                # Set endpoint limit from command line argument
+                                self.api.apisession.endpointLimit(self.endpoint_limit)
+
+                        CONSOLE.info("\nRunning site refresh...")
+                        await self.api.update_sites(
+                            fromFile=self.use_file, siteId=self.site_selected
+                        )
+                        self.next_dev_refr -= 1
+                        if not self.use_file and self.energy_stats and deferred:
+                            if self.energy_refresh_allowed():
+                                CONSOLE.info("Running energy details refresh...")
+                                await self.api.update_device_energy(fromFile=self.use_file)
+                                deferred = False
+                            else:
+                                CONSOLE.warning(
+                                    "Skipping deferred energy details refresh due to energy_analysis backoff."
+                                )
+                        self.next_refr = datetime.now().astimezone() + timedelta(
+                            seconds=self.refresh_interval
+                        )
+                    if self.next_dev_refr < 0:
+                        CONSOLE.info(
+                            "Running device and site details refresh%s...",
+                            ", excluding " + str({SolixDeviceType.VEHICLE.value})
+                            if self.site_selected #or not self.showVehicles
+                            else "",
+                        )
+                        # skip Vehicle data if dedicated site selected or vehicles disabled
+                        await self.api.update_device_details(
+                            fromFile=self.use_file,
+                            exclude={SolixDeviceType.VEHICLE.value}
+                            if self.site_selected #or not self.showVehicles
+                            else None,
+                        )
+                        await self.api.update_site_details(fromFile=self.use_file)
+                        # run also energy refresh if requested
+                        if self.energy_stats:
+                            if startup and not self.use_file:
+                                CONSOLE.info("Deferring initial energy details refresh...")
+                                startup = False
+                                deferred = True
+                            else:
+                                if self.energy_refresh_allowed():
+                                    CONSOLE.info("Running energy details refresh...")
+                                    await self.api.update_device_energy(
+                                        fromFile=self.use_file
+                                    )
+                                else:
+                                    CONSOLE.warning(
+                                        "Skipping energy details refresh due to energy_analysis backoff."
+                                    )
+
+                                startup = False
+                        self.next_refr = datetime.now().astimezone() + timedelta(
+                            seconds=self.refresh_interval
+                        )
+                        self.next_dev_refr = details_refresh
+
+                        # Auto-start MQTT session if enabled via command line
+                        '''
+                        if (
+                            self.enable_mqtt
+                            and not self.api.mqttsession
+                            and not self.use_file
+                        ):
+                            CONSOLE.info("Auto-starting MQTT session...")
+                            if mqttsession := await self.api.startMqttSession(
+                                fromFile=self.use_file
+                            ):
+                                # generate actual MQTT devices and track them in class
+                                self.generate_mqtt_devices()
+                                devs = [
+                                    dev
+                                    for dev in self.api.devices.values()
+                                    if dev.get("mqtt_supported")
+                                ]
+                                if mqttsession.is_connected():
+                                    CONSOLE.info(
+                                        f"{Color.GREEN}MQTT session connected{Color.OFF}, subscribing eligible devices..."
+                                    )
+                                    for dev in devs:
+                                        # subscribe device
+                                        topic = f"{mqttsession.get_topic_prefix(deviceDict=dev)}#"
+                                        resp = mqttsession.subscribe(topic)
+                                        if resp and resp.is_failure:
+                                            CONSOLE.info(
+                                                f"{Color.RED}Failed subscription for topic: {topic}{Color.OFF}"
+                                            )
+                                    # set the value print as callback for mqtt value refreshes
+                                    self.api.mqtt_update_callback(
+                                        func=self.print_device_mqtt
+                                    )
+                                    # Auto-trigger realtime if enabled via command line
+                                    if self.enable_realtime and self.mqtt_devices:
+                                        CONSOLE.info(
+                                            f"{Color.CYAN}Auto-triggering real time MQTT data for {self.rt_timeout} seconds... "
+                                        )
+                                        for mdev in self.mqtt_devices.values():
+                                            if await mdev.realtime_trigger(
+                                                timeout=self.rt_timeout
+                                            ):
+                                                mqttsession.triggered_devices.add(
+                                                    mdev.sn
+                                                )
+                                            else:
+                                                mqttsession.triggered_devices.discard(
+                                                    mdev.sn
+                                                )
+                                        if mqttsession.triggered_devices:
+                                            self.triggered = datetime.now() + timedelta(
+                                                seconds=self.rt_timeout
+                                            )
+                                    if not devs:
+                                        CONSOLE.info(
+                                            f"{Color.YELLOW}No eligible MQTT devices found!{Color.OFF}"
+                                        )
+                                else:
+                                    CONSOLE.info(
+                                        f"{Color.YELLOW}MQTT client not fully connected yet, skipping subscription and real-time trigger{Color.OFF}"
+                                    )
+                            else:
+                                CONSOLE.info(
+                                    f"{Color.RED}Failed to start MQTT session!{Color.OFF}"
+                                )
+                        '''
+                        # Generate device list for output filter toggle
+                        if not self.device_names:
+                            self.device_names = ["All"] + [
+                                (
+                                    ", ".join(
+                                        [
+                                            str(d.get("device_sn")),
+                                            str(d.get("name")),
+                                            f"Type: {d.get('device_pn')} ({d.get('type') or 'unknown'})",
+                                            f"System: {d.get('site_id')}",
+                                        ]
+                                    )
+                                )
+                                for d in self.api.devices.values()
+                                if (
+                                    not self.site_selected
+                                    or d.get("site_id") == self.site_selected
+                                )
+                            ]
+                        # Ask if output should be filtered to certain device
+                        if (
+                            self.interactive
+                            and self.device_filter is None
+                            and len(self.device_names) > 2
+                        ):
+                            self.pause_output = True
+                            CONSOLE.info(
+                                "Select which device should be filtered in output:"
+                            )
+                            for idx, devicename in enumerate(self.device_names):
+                                CONSOLE.info(
+                                    f"({Color.YELLOW}{idx}{Color.OFF}) {devicename}"
+                                )
+                            selection = await self.async_inupt(
+                                f"Enter device number ({Color.YELLOW}0-{len(self.device_names) - 1}{Color.OFF}) or nothing for {Color.CYAN}All{Color.OFF}: ",
+                            )
+                            if (
+                                selection
+                                and selection.isdigit()
+                                and 1 <= int(selection) < len(self.device_names)
+                            ):
+                                self.device_filter = self.device_names[
+                                    int(selection)
+                                ].split(",", maxsplit=1)[0]
+                            else:
+                                self.device_filter = ""
+                            self.pause_output = False
+                    '''
+                    if self.showMqttDevice:
+                        self.print_device_mqtt(deviceSn=None)
+                    else:
+                        common.clearscreen()
+                        # print the data with MQTT mixin if MQTT session is active
+                        self.print_api_data(mqtt_mixin=bool(self.api.mqttsession))
+                    '''
+                    self.print_console_data()
+                    if self.console_detail != "silent":
+                        CONSOLE.info("Api Requests: %s", self.api.request_count)
+                    CONSOLE.log(
+                        logging.INFO if self.showApiCalls else logging.DEBUG,
+                        self.api.request_count.get_details(last_hour=True),
+                    )
+                    await self.wait_until_next_refresh()
+                  except (ClientError, AnkerSolixError, asyncio.TimeoutError) as err:
+                    self.schedule_api_retry(err, context="Monitor refresh")
+                    await self.wait_until_next_refresh()
+                    continue
+        except (asyncio.CancelledError, KeyboardInterrupt) as err:
+            if isinstance(err, ClientError | AnkerSolixError):
+                return
+        except (ClientError, AnkerSolixError, asyncio.TimeoutError) as err:
+            CONSOLE.error(
+                "Fatal API setup error before monitor loop could continue: %s: %s",
+                type(err).__name__,
+                err,
+            )
+            if self.api:
+                CONSOLE.info("Api Requests: %s", self.api.request_count)
+                CONSOLE.info(self.api.request_count.get_details(last_hour=True))
+            return
+        finally:
+            if self.storage_task:
+                self.storage_task.cancel()
+                try:
+                    await self.storage_task
+                except asyncio.CancelledError:
+                    pass
+                self.storage_task = None
+
+            await self.stop_webserver()
+            
+            if self.api:
+                if self.api.mqttsession:
+                    CONSOLE.info("Disconnecting from MQTT server...")
+                    self.api.mqttsession.cleanup()
+
+    async def start_webserver(self) -> None:
+        """Start a small static webserver for a configured folder.
+
+        The server serves index.html from the configured folder at:
+            /
+
+        All other files below the folder are served statically.
+        """
+        if not self.web_folder:
+            return
+
+        folder = self.web_folder.resolve()
+        folder.mkdir(parents=True, exist_ok=True)
+
+        index_file = folder / "index.html"
+
+        app = web.Application()
+
+        async def serve_index(request: web.Request) -> web.FileResponse:
+            if not index_file.is_file():
+                raise web.HTTPNotFound(
+                    text=f"index.html not found in {folder}",
+                )
+
+            return web.FileResponse(index_file)
+
+        # Explicitly serve index.html for the root URL.
+        app.router.add_get("/", serve_index)
+        app.router.add_get("/index.html", serve_index)
+
+        # Serve all other static files from the selected folder.
+        app.router.add_static(
+            "/",
+            path=str(folder),
+            show_index=False,
+            follow_symlinks=False,
+        )
+
+        self.web_runner = web.AppRunner(app)
+        await self.web_runner.setup()
+
+        site = web.TCPSite(
+            self.web_runner,
+            host=self.web_host,
+            port=self.web_port,
+        )
+        await site.start()
+
+        CONSOLE.info(
+            "Webserver running: http://%s:%s/ serving index %s",
+            self.web_host,
+            self.web_port,
+            index_file,
+        )
+
+
+    async def stop_webserver(self) -> None:
+        """Stop the built-in webserver."""
+        if self.web_runner:
+            CONSOLE.info("Stopping webserver...")
+            await self.web_runner.cleanup()
+            self.web_runner = None
+
+# run async main
+if __name__ == "__main__":
+    try:
+        # Parse command line arguments
+        arg: argparse.Namespace = parse_arguments()
+
+        # Print configuration when in non-interactive mode
+        if arg.live_cloud:
+            CONSOLE.info("Launch settings:")
+            CONSOLE.info(f"  Live cloud mode: {Color.GREEN}Enabled{Color.OFF}")
+            '''
+            CONSOLE.info(
+                f"  MQTT session: {(Color.GREEN + 'Enabled') if arg.enable_mqtt else (Color.RED + 'Disabled')}{Color.OFF}"
+            )
+            CONSOLE.info(
+                f"  MQTT display mode: {(Color.GREEN + 'Pure MQTT') if arg.mqtt_display else (Color.CYAN + 'Mixed API+MQTT')}{Color.OFF}"
+            )
+            CONSOLE.info(
+                f"  Real-time trigger: {(Color.GREEN + 'Enabled') if arg.realtime_trigger else (Color.RED + 'Disabled')}{Color.OFF}"
+            )
+            CONSOLE.info(
+                f"  Refresh interval: {Color.CYAN}{arg.interval}{Color.OFF} seconds"
+            )
+            CONSOLE.info(
+                f"  Energy statistics: {(Color.GREEN + 'Enabled') if arg.energy_stats else (Color.RED + 'Disabled')}{Color.OFF}"
+            )
+            if arg.site_id:
+                CONSOLE.info(
+                    f"  Monitoring site: {Color.YELLOW}{arg.site_id}{Color.OFF}"
+                )
+            if arg.device_id:
+                CONSOLE.info(
+                    f"  Device filter: {Color.YELLOW}{arg.device_id}{Color.OFF}"
+                )
+            CONSOLE.info(
+                f"  Electric vehicles: {(Color.GREEN + 'Enabled') if arg.no_vehicles else (Color.RED + 'Disabled')}{Color.OFF}"
+            )
+            '''
+            CONSOLE.info(
+                f"  API call statistics: {(Color.GREEN + 'Enabled') if arg.api_calls else (Color.RED + 'Disabled')}{Color.OFF}"
+            )
+            CONSOLE.info(
+                f"  HTTP debug logging: {(Color.GREEN + 'Enabled') if arg.debug_http else (Color.RED + 'Disabled')}{Color.OFF}"
+            )
+            CONSOLE.info(
+                f"  Endpoint limit: {(Color.CYAN + str(arg.endpoint_limit)) if arg.endpoint_limit else (Color.RED + 'Disabled')}{Color.OFF}"
+            )
+            CONSOLE.info("")
+        if not asyncio.run(AnkerSolixApiMonitor(arg).main(), debug=False):
+            CONSOLE.warning("Aborted!")
+    except KeyboardInterrupt:
+        CONSOLE.warning("Aborted!")
+    except Exception as exception:  # pylint: disable=broad-exception-caught  # noqa: BLE001
+        CONSOLE.exception("%s: %s", type(exception), exception)

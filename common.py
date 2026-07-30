@@ -1,0 +1,594 @@
+#!/usr/bin/env python
+"""A collection of helper functions for pyscripts."""
+
+import contextlib
+import datetime
+import getpass
+import json
+import logging
+import os
+from pathlib import Path
+import select
+import sys
+
+from anker_solix_api.apitypes import (
+    Color,
+    SolarbankRatePlan,
+    SolarbankSchedulePresetType,
+    SolarbankUsageMode,
+)
+from anker_solix_api.helpers import get_enum_name, round_by_factor
+from anker_solix_api.mqtt_device import SolixMqttDevice
+from anker_solix_api.mqttcmdmap import (
+    LENGTH,
+    STATE_CONVERTER,
+    STATE_NAME,
+    VALUE_DEFAULT,
+    VALUE_FOLLOWS,
+    VALUE_MAX,
+    VALUE_MIN,
+    VALUE_OPTIONS,
+    VALUE_STATE,
+    VALUE_STEP,
+)
+from anker_solix_api.mqtttypes import convert_weekdays
+
+# platform dependent imports for key press handling
+if sys.platform.startswith("win"):
+    import msvcrt
+elif sys.platform.startswith("linux") or sys.platform.startswith("darwin"):
+    # darwin = macOS
+    import termios
+    import tty
+else:
+    raise NotImplementedError(f"Unsupported platform: {sys.platform}")
+
+
+class InlineStreamHandler(logging.StreamHandler):
+    """Stream Handler that removes the newline."""
+
+    def emit(self, record):
+        """Log without newline."""
+        msg = self.format(record)
+        self.stream.write(msg)  # No newline
+        self.flush()
+
+
+class SamelineStreamHandler(logging.StreamHandler):
+    """Stream Handler that does line feed to overwrite same line."""
+
+    def emit(self, record):
+        """Log with carriage return."""
+        msg = self.format(record)
+        self.stream.write(msg + "\r")  # log with carriage return
+        self.flush()
+
+
+# create CONSOLE logger for screen output
+CONSOLE: logging.Logger = logging.getLogger(__name__)
+# Set parent to lowest level to allow messages passed to all handlers using their own level
+CONSOLE.setLevel(logging.DEBUG)
+# create console handler and set level to info
+ch = logging.StreamHandler()
+# This can be changed to DEBUG if more messages should be printed to console
+ch.setLevel(logging.INFO)
+CONSOLE.addHandler(ch)
+
+# create INLINE logger for screen output without newline
+INLINE: logging.Logger = logging.getLogger("Inline_logger")
+# Set parent to lowest level to allow messages passed to all handlers using their own level
+INLINE.setLevel(logging.DEBUG)
+# create console handler and set level to info and formatting without newline
+handler = InlineStreamHandler()
+handler.setLevel(logging.INFO)
+# No newline in format
+handler.setFormatter(logging.Formatter("%(message)s"))
+INLINE.addHandler(handler)
+
+# create SAMELINE logger for screen output within same line
+SAMELINE: logging.Logger = logging.getLogger("Sameline_logger")
+# Set parent to lowest level to allow messages passed to all handlers using their own level
+SAMELINE.setLevel(logging.DEBUG)
+# create console handler and set level to info and formatting without newline but line feed
+handler = SamelineStreamHandler()
+handler.setLevel(logging.INFO)
+# Linefeed in format
+handler.setFormatter(logging.Formatter("%(message)s"))
+SAMELINE.addHandler(handler)
+
+# Optional default Anker Account credentials to be used
+# load environment variables from .env file at runtime if file exists
+if (Path(__file__).parent / ".env").is_file():
+    from dotenv import load_dotenv
+
+    load_dotenv()
+_CREDENTIALS = {
+    "USER": os.getenv("ANKER_USER", ""),
+    "PASSWORD": os.getenv("ANKER_PASSWORD", ""),
+    "COUNTRY": os.getenv("ANKER_COUNTRY", ""),
+}
+
+
+def set_credentials(
+    user_value: str | None = None,
+    password_value: str | None = None,
+    country_value: str | None = None,
+) -> None:
+    """Set Anker account credentials at runtime.
+
+    Values from the monitor config file can be injected here.
+    Environment variables are still supported as fallback.
+    """
+    if user_value is not None:
+        _CREDENTIALS["USER"] = user_value
+
+    if password_value is not None:
+        _CREDENTIALS["PASSWORD"] = password_value
+
+    if country_value is not None:
+        _CREDENTIALS["COUNTRY"] = country_value
+
+
+def user() -> str:
+    """Get anker account user."""
+    if _CREDENTIALS.get("USER"):
+        return _CREDENTIALS["USER"]
+    CONSOLE.info("Enter Anker Account credentials:")
+    username = input("Username (email): ")
+    while not username:
+        username = input("Username (email): ")
+    return username
+
+
+def password() -> str:
+    """Get anker account password."""
+    if _CREDENTIALS.get("PASSWORD"):
+        return _CREDENTIALS["PASSWORD"]
+    pwd = getpass.getpass("Password: ")
+    while not pwd:
+        pwd = getpass.getpass("Password: ")
+    return pwd
+
+
+def country() -> str:
+    """Get anker account country."""
+    if _CREDENTIALS.get("COUNTRY"):
+        return _CREDENTIALS["COUNTRY"]
+    countrycode = input("Country ID (e.g. DE): ")
+    while not countrycode:
+        countrycode = input("Country ID (e.g. DE): ")
+    return countrycode
+
+
+def print_schedule(schedule: dict) -> None:
+    """Print the schedule ranges as table."""
+    t2 = 2
+    t3 = 3
+    t5 = 5
+    t6 = 6
+    t9 = 9
+    t10 = 10
+    plan = schedule or {}
+    if usage_mode := plan.get("mode_type") or 0:
+        # SB2 schedule
+        CONSOLE.info(
+            f"{'Usage Mode':<{t2}}: {str(SolarbankUsageMode(usage_mode).name if usage_mode in iter(SolarbankUsageMode) else 'Unknown').capitalize() + ' (' + str(usage_mode) + ')':<{t5 + t5 + t6}} "
+            f"{'Def. Preset':<{t5}}: {plan.get('default_home_load', '----'):>4} W   (Range: {plan.get('min_load', '?')} - {plan.get('max_load', '???')} W)"
+        )
+        week = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+        for rate_plan_name in [SolarbankRatePlan.manual, SolarbankRatePlan.smartplugs]:
+            for idx in plan.get(rate_plan_name) or [{}]:
+                index = idx.get("index", "--")
+                weekdays = [week[day] for day in idx.get("week") or []]
+                if ranges := idx.get("ranges") or []:
+                    CONSOLE.info(
+                        f"{'ID':<{t2}} {'Start':<{t5}} {'End':<{t5}}  {'Load':<{t6}}  {'Type':<{t9}}  {'Weekdays':<{t6}}             "
+                        f"<== {rate_plan_name}{' (Smart plugs)' if rate_plan_name == SolarbankRatePlan.smartplugs else ''}"
+                    )
+                for slot in ranges:
+                    CONSOLE.info(
+                        f"{index!s:>{t2}} {slot.get('start_time', '')!s:<{t5}} {slot.get('end_time', '')!s:<{t5}}  {str(slot.get('power', '')) + ' W':>{t6}}  "
+                        f"{str(get_enum_name(SolarbankSchedulePresetType, slot.get('charging_type', 0), f'({slot.get("charging_type", "----")})')).replace('_', ' ').title():<{t9}}  "
+                        f"{','.join(weekdays):<{t6}}"
+                    )
+        # AC specific plans
+        if (rate_plan := plan.get(SolarbankRatePlan.backup) or {}) and (
+            ranges := rate_plan.get("ranges") or []
+        ):
+            CONSOLE.info(
+                f"{'Backup Start':<{t10 + t10}} {'Backup End':<{t10 + t10}} Switch: {'ON' if rate_plan.get('switch') else 'OFF':<{t3}}   <== manual_backup"
+            )
+            for slot in ranges:
+                CONSOLE.info(
+                    f"{datetime.datetime.fromtimestamp(slot.get('start_time', 0), datetime.UTC).astimezone().strftime('%Y-%m-%d %H:%M'):<{t10 + t10}} "
+                    f"{datetime.datetime.fromtimestamp(slot.get('end_time', 0), datetime.UTC).astimezone().strftime('%Y-%m-%d %H:%M'):<{t10 + t10}}"
+                )
+        if rate_plan := plan.get(SolarbankRatePlan.use_time) or []:
+            tariffs = ["High", "Medium", "Low", "Valley"]
+            for sea in rate_plan:
+                unit = sea.get("unit") or "-"
+                m_start = (
+                    datetime.datetime.now()
+                    .date()
+                    .replace(
+                        day=1, month=(sea.get("sea") or {}).get("start_month") or 1
+                    )
+                )
+                m_end = (
+                    datetime.datetime.now()
+                    .date()
+                    .replace(day=1, month=(sea.get("sea") or {}).get("end_month") or 1)
+                )
+                is_same = sea.get("is_same")
+                weekday = sea.get("weekday") or []
+                weekend = sea.get("weekend") or []
+                today = (
+                    datetime.datetime.now()
+                    .astimezone()
+                    .replace(hour=0, minute=0, second=0, microsecond=0)
+                )
+                CONSOLE.info(
+                    f"Season: {m_start.strftime('%b')} - {m_end.strftime('%b')},           Weekends: {'SAME' if is_same else 'DIFF'}             <== use_time"
+                )
+                CONSOLE.info(
+                    f"{'Start':<{t5}} {'End':<{t5}} {'Type':<{t6}} {'Price':<{t6}}    {'Start':<{t5}} {'End':<{t5}} {'Type':<{t6}} {'Price':<{t6}}"
+                )
+                for idx in range(max(len(weekday), len(weekend))):
+                    if len(weekday) > idx:
+                        tariff = weekday[idx].get("type")
+                        price = next(
+                            iter(
+                                [
+                                    item.get("price")
+                                    for item in (sea.get("weekday_price") or [])
+                                    if item.get("type") == tariff
+                                ]
+                            ),
+                            0,
+                        )
+                        tariff = (
+                            tariffs[tariff - 1]
+                            if isinstance(tariff, int) and 0 < tariff <= len(tariffs)
+                            else "------"
+                        )
+                        start = today + datetime.timedelta(
+                            hours=weekday[idx].get("start_time") or 0
+                        )
+                        end = weekday[idx].get("end_time") or 24
+                        end = today + (
+                            datetime.timedelta(hours=end)
+                            if end < 24
+                            else datetime.timedelta(days=1)
+                        )
+                        row = f"{start.strftime('%H:%M'):<{t5}} {end.strftime('%H:%M'):<{t5}} {tariff:<{t6}} {float(price):<.02f} {unit:<{t2}}"
+                    else:
+                        row = " " * 26
+                    if len(weekend) > idx:
+                        tariff = weekend[idx].get("type")
+                        price = next(
+                            iter(
+                                [
+                                    item.get("price")
+                                    for item in (sea.get("weekend_price") or [])
+                                    if item.get("type") == tariff
+                                ]
+                            ),
+                            0,
+                        )
+                        tariff = (
+                            tariffs[tariff - 1]
+                            if isinstance(tariff, int) and 0 < tariff <= len(tariffs)
+                            else "------"
+                        )
+                        start = today + datetime.timedelta(
+                            hours=weekend[idx].get("start_time") or 0
+                        )
+                        end = weekend[idx].get("end_time") or 24
+                        end = today + (
+                            datetime.timedelta(hours=end)
+                            if end < 24
+                            else datetime.timedelta(days=1)
+                        )
+                        row = (
+                            row
+                            + f"   {start.strftime('%H:%M'):<{t5}} {end.strftime('%H:%M'):<{t5}} {tariff:<{t6}} {float(price):<.02f} {unit:<{t2}}"
+                        )
+                    CONSOLE.info(row)
+
+    else:
+        # SB1 schedule
+        if ranges := plan.get("ranges") or []:
+            CONSOLE.info(
+                f"{'ID':<{t2}} {'Start':<{t5}} {'End':<{t5}} {'Export':<{t6}} {'Output':<{t6}} {'ChargePrio':<{t10}} {'DisChPrio':<{t9}} {'SB1':>{t6}} {'SB2':>{t6}} {'Mode':>{t5}} Name"
+            )
+        for slot in ranges:
+            enabled = slot.get("turn_on")
+            discharge = (
+                slot.get("priority_discharge_switch")
+                if plan.get("is_show_priority_discharge")
+                else None
+            )
+            load = slot.get("appliance_loads", [])
+            load = load[0] if len(load) > 0 else {}
+            solarbanks = slot.get("device_power_loads") or []
+            sb1 = str(solarbanks[0].get("power") if len(solarbanks) > 0 else "---")
+            sb2 = str(solarbanks[1].get("power") if len(solarbanks) > 1 else "---")
+            CONSOLE.info(
+                f"{slot.get('id', '')!s:>{t2}} {slot.get('start_time', '')!s:<{t5}} {slot.get('end_time', '')!s:<{t5}} "
+                f"{('---' if enabled is None else 'YES' if enabled else 'NO'):^{t6}} {str(load.get('power', '')) + ' W':>{t6}} "
+                f"{str(slot.get('charge_priority', '')) + ' %':>{t10}} {('---' if discharge is None else 'YES' if discharge else 'NO'):>{t9}} "
+                f"{sb1 + ' W':>{t6}} {sb2 + ' W':>{t6}} {slot.get('power_setting_mode', '-')!s:^{t5}} {load.get('name', '')!s}"
+            )
+
+
+def print_products(products: dict) -> None:
+    """Print the products as table."""
+    col1 = 6
+    col2 = 40
+    CONSOLE.info(f"{'Model':<{col1}} {'Name':<{col2}} Platform")
+    CONSOLE.info(f"{'-' * 100}")
+    models = list(products.keys())
+    models.sort()
+    counts = {}
+    for model, product in [(model, products.get(model)) for model in models]:
+        # for model, product in products.items():
+        platform = product.get("platform") or ""
+        CONSOLE.info(f"{model:<{col1}} {product.get('name') or '':<{col2}} {platform}")
+        counts["Models"] = (counts.get("Models") or 0) + 1
+        counts[platform] = (counts.get(platform) or 0) + 1
+    CONSOLE.info(f"{'-' * 100}")
+    m = counts.pop("Models", None)
+    CONSOLE.info(f"Summary: {(m or 0)!s} Models")
+    for key, value in counts.items():
+        CONSOLE.info(f"{value!s:>2} {key}")
+
+
+def clearscreen():
+    """Clear the terminal screen."""
+    if sys.stdin is sys.__stdin__:  # check if not in IDLE shell
+        if os.name == "nt":
+            os.system("cls")
+        else:
+            os.system("clear")
+        # CONSOLE.info("\033[H\033[2J", end="")  # ESC characters to clear terminal screen, system independent?
+
+
+KEY_MAPPING = {
+    127: "backspace",
+    10: "return",
+    32: "space",
+    9: "tab",
+    27: "esc",
+    65: "up",
+    66: "down",
+    67: "right",
+    68: "left",
+}
+
+
+def getkey() -> str | None:
+    """Blocking function to read a single keypress."""
+    fd = sys.stdin.fileno()
+    try:
+        if sys.platform.startswith("win"):
+            if msvcrt.kbhit():
+                k = msvcrt.getch()
+                # Handle special keys (arrows, function keys)
+                if k in [b"\x00", b"\xe0"]:
+                    # special key mapping for windows, read next byte
+                    k = msvcrt.getch()
+                    match k:
+                        case b"H":
+                            k = 65
+                        case b"P":
+                            k = 66
+                        case b"M":
+                            k = 67
+                        case b"K":
+                            k = 68
+                        case _:
+                            k = ord(k)
+                elif k in [b"\r", b"\n"]:
+                    k = 10
+                elif k == b"\x08":
+                    k = 127
+                else:
+                    k = ord(k)
+                return KEY_MAPPING.get(k, chr(k))
+        else:
+            old_settings = None
+            with contextlib.suppress(termios.error):
+                old_settings = termios.tcgetattr(fd)
+                # Enable C-Break mode for terminal
+                tty.setcbreak(fd, when=1)
+                # check if input ready, 2-seconds timeout
+                ready, _, _ = select.select([fd], [], [], 2)
+                if ready:
+                    b = os.read(fd, 3).decode()
+                    if len(b) == 3:
+                        k = ord(b[2])
+                    else:
+                        k = ord(b[0])
+                    return KEY_MAPPING.get(k, chr(k))
+    finally:
+        # This will always be run before returning
+        if not sys.platform.startswith("win") and old_settings:
+            with contextlib.suppress(termios.error):
+                termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+
+def query_mqtt_command(  # noqa: C901
+    mdev: SolixMqttDevice, toFile: bool = False
+) -> tuple[str, dict] | None:
+    """Query, validate and return MQTT command and parameters for provided MQTT device."""
+    if not isinstance(mdev, SolixMqttDevice):
+        CONSOLE.error(f"{Color.YELLOW}No MQTT device provided for control.{Color.OFF}")
+        return None
+    if mdev.is_passive():
+        CONSOLE.error(
+            f"{Color.RED}MQTT device {mdev.sn} ({mdev.pn}) does not support any controls while running in local mode.{Color.OFF}"
+        )
+        return None
+    # get supported commands, catch keyboard interrupt to allow user to cancel command selection
+    try:
+        if len(commands := list(mdev.controls.keys())) > 1:
+            # select command to be used
+            CONSOLE.info(
+                f"Select a supported command for device '{Color.CYAN}{mdev.sn} ({mdev.pn}){Color.OFF}':"
+            )
+            for idx, item in enumerate(itemlist := commands, start=1):
+                CONSOLE.info(f"({Color.YELLOW}{idx}{Color.OFF}) {item}")
+            while True:
+                sel = input(
+                    f"Select {Color.YELLOW}ID{Color.OFF} or [{Color.RED}C{Color.OFF}]ancel: "
+                )
+                if sel.upper() in ["C", "CANCEL", ""]:
+                    return None
+                if sel.isdigit() and 1 <= (sel := int(sel)) <= len(itemlist):
+                    cmd = itemlist[sel - 1]
+                    break
+        elif not commands:
+            CONSOLE.error(
+                f"{Color.YELLOW}MQTT device {mdev.sn} ({mdev.pn}) does not support any controls.{Color.OFF}"
+            )
+            return None
+        else:
+            cmd = commands[0]
+        parameters = {}
+        CONSOLE.info(
+            f"Enter parameter values for device command '{Color.CYAN}{cmd}{Color.OFF}':"
+        )
+        # get required parameters
+        for parm, desc in mdev.get_cmd_parms(cmd=cmd, defaults=True).items():
+            value_info = ""
+            step = 1
+            if v := desc.get(VALUE_OPTIONS):
+                value_info = f"{Color.YELLOW}{v}"
+            elif str(desc.get(STATE_NAME)).endswith("_time"):
+                # special case for fields indicating (seconds), minutes, hours per byte
+                value_info = f"{Color.YELLOW}({'00:00-23:59' if 0 <= desc.get(VALUE_MAX, 0) <= 5947 else '00:00:00-23:59:59'})"
+            elif str(desc.get(STATE_NAME)).endswith("_weekdays"):
+                # special case for fields indicating bitmask for weekdays
+                value_info = (
+                    f"{Color.YELLOW}({['all', *convert_weekdays(b'\x7f')]})".replace(
+                        ", ", "|"
+                    )
+                )
+            elif (v := desc.get(VALUE_MIN)) is not None:
+                value_info = f"{Color.YELLOW}({v}-{desc.get(VALUE_MAX) or v})"
+                if (v := desc.get(VALUE_STEP)) is not None:
+                    step = v
+                    value_info += f", step {v}"
+            elif desc.get("is_text"):
+                value_info = f"{Color.YELLOW}(<Text:{abs(desc.get(LENGTH, 0))}>)"
+            # query default parameters only if value has validation descriptors
+            if value_info:
+                if (v := desc.get(VALUE_DEFAULT)) is not None or (
+                    callable(v := desc.get(STATE_CONVERTER))
+                    and (v := v(None, None, mdev.get_status(fromFile=toFile)))
+                    is not None
+                ):
+                    value_info += f"{Color.OFF}, [{Color.GREEN}ENTER{Color.OFF}] for default ({Color.GREEN}{v}{Color.OFF})"
+                while True:
+                    sel = input(
+                        f"Provide {Color.YELLOW}value{Color.OFF} for parameter {Color.CYAN}{parm} {value_info}{Color.OFF} or [{Color.RED}C{Color.OFF}] to Cancel: "
+                    )
+                    if sel.upper() in ["C", "CANCEL"]:
+                        return None
+                    if not sel and (VALUE_DEFAULT in desc or VALUE_FOLLOWS in desc):
+                        sel = None
+                        break
+                    # convert string to number
+                    if sel.replace("-", "", 1).replace(".", "", 1).isdigit():
+                        sel = round_by_factor(float(sel), step)
+                    elif sel.startswith(("[", "{")):
+                        with contextlib.suppress(json.decoder.JSONDecodeError):
+                            sel = json.loads(sel)
+                    else:
+                        sel = sel.strip("'\"")
+                    if (
+                        val := mdev.validate_cmd_value(cmd=cmd, value=sel, parm=parm)
+                    ) is not None:
+                        sel = val
+                        break
+                    # exit loop if input was cancelled
+                    if not sel:
+                        return None
+                if sel is not None:
+                    parameters[parm] = sel
+        # get optional states and follow parameters
+        for parm, desc in mdev.get_cmd_parms(
+            cmd=cmd, state_parms=True, follow_parms=True
+        ).items():
+            value_info = ""
+            step = 1
+            state = None
+            if v := desc.get(VALUE_OPTIONS):
+                value_info = f"{Color.YELLOW}{v}"
+            elif str(desc.get(STATE_NAME)).endswith("_time"):
+                # special case for fields indicating (seconds), minutes, hours per byte
+                value_info = f"{Color.YELLOW}({'00:00-23:59' if 0 <= desc.get(VALUE_MAX, 0) <= 5947 else '00:00:00-23:59:59'})"
+            elif str(desc.get(STATE_NAME)).endswith("_weekdays"):
+                # special case for fields indicating bitmask for weekdays
+                value_info = (
+                    f"{Color.YELLOW}({['all', *convert_weekdays(b'\x7f')]})".replace(
+                        ", ", "|"
+                    )
+                )
+            elif (v := desc.get(VALUE_MIN)) is not None:
+                value_info = f"{Color.YELLOW}({v}-{desc.get(VALUE_MAX) or v})"
+                if (v := desc.get(VALUE_STEP)) is not None:
+                    step = v
+                    value_info += f", step {v}"
+            elif desc.get("is_text"):
+                value_info = f"{Color.YELLOW}(<Text:{abs(desc.get(LENGTH, 0))}>)"
+            # query default parameters only if value has validation descriptors
+            if value_info:
+                if (v := desc.get(VALUE_STATE)) is not None and (
+                    state := mdev.get_status(fromFile=toFile).get(v)
+                ) is not None:
+                    value_info += f"{Color.OFF}, [{Color.GREEN}ENTER{Color.OFF}] to use last state ({Color.GREEN}{state}{Color.OFF})"
+                elif (v := desc.get(VALUE_FOLLOWS)) is not None:
+                    state = (mdev.get_status(fromFile=toFile) | parameters).get(v)
+                    # convert state as required
+                    if isinstance(options := desc.get(VALUE_OPTIONS), dict):
+                        # get follow state from option map
+                        state = options.get(state)
+                    elif callable(converter := desc.get(STATE_CONVERTER)):
+                        state = converter(state, None, mdev.get_status(fromFile=toFile))
+                    if state is not None:
+                        value_info += f"{Color.OFF}, [{Color.GREEN}ENTER{Color.OFF}] to use follow state ({Color.GREEN}{state}{Color.OFF})"
+                elif (v := desc.get(VALUE_DEFAULT)) is not None:
+                    value_info += f"{Color.OFF}, [{Color.GREEN}ENTER{Color.OFF}] for default ({Color.GREEN}{v}{Color.OFF})"
+                while True:
+                    sel = input(
+                        f"Provide {Color.YELLOW}value{Color.OFF} for parameter {Color.CYAN}{parm} {value_info}{Color.OFF} or [{Color.RED}C{Color.OFF}] to Cancel: "
+                    )
+                    if sel.upper() in ["C", "CANCEL"]:
+                        return None
+                    if not sel and (state is not None or VALUE_DEFAULT in desc):
+                        sel = None
+                        break
+                    # convert string to number
+                    if sel.replace("-", "", 1).replace(".", "", 1).isdigit():
+                        sel = round_by_factor(float(sel), step)
+                    elif sel.startswith(("[", "{")):
+                        with contextlib.suppress(json.decoder.JSONDecodeError):
+                            sel = json.loads(sel)
+                    else:
+                        sel = sel.strip("'\"")
+                    if (
+                        val := mdev.validate_cmd_value(cmd=cmd, value=sel, parm=parm)
+                    ) is not None:
+                        sel = val
+                        break
+                    # exit loop if input was cancelled
+                    if not sel:
+                        return None
+                if sel is not None:
+                    parameters[parm] = sel
+    except KeyboardInterrupt:
+        CONSOLE.info(f"\n{Color.RED}[Input cancelled]{Color.OFF}")
+        return None
+    else:
+        return (cmd, parameters)
