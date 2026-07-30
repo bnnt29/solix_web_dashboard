@@ -1,7 +1,8 @@
 FROM python:3.12-slim
 
 ENV PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH=/app/solix_web_dashboard/src:/app/solix_web_dashboard/src/api
 
 WORKDIR /app
 
@@ -12,13 +13,27 @@ RUN apt-get update \
 
 COPY requirements.txt .
 
+RUN git clone --recurse-submodules https://github.com/bnnt29/solix_web_dashboard.git solix_web_dashboard
+
+WORKDIR /app/solix_web_dashboard
+
 RUN pip install --no-cache-dir -r requirements.txt
 
-RUN git clone --recurse-submodules https://github.com/bnnt29/solix_web_dashboard.git solix_web_dashboard
 
 COPY . .
 
 # Webserver port
 EXPOSE 8080
 
-CMD ["python", "/app/solix_web_dashboard/src/api/pv_monitor.py"]
+CMD ["python", "/app/solix_web_dashboard/src/api/pv_monitor.py", \
+     "--live-cloud", \
+     "--energy-stats", \
+     "--interval", "30", \
+     "--sample-interval", "10", \
+     "--storage-root", "/app/solix_web_dashboard/src/dashboard/exports/timeseries", \
+     "--web-folder", "/app/solix_web_dashboard/src/dashboard", \
+     "--web-host", "0.0.0.0", \
+     "--web-port", "8080", \
+     "--config", "/app/config/solix-monitor.config.json", \
+     "--console-detail", "compact", \
+     "--console-log-level", "INFO"]
