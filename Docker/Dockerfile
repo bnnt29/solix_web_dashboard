@@ -17,8 +17,7 @@ RUN git clone --recurse-submodules https://github.com/bnnt29/solix_web_dashboard
 RUN rm -rf /app/solix_web_dashboard/src/solix_api \
     && git clone https://github.com/thomluther/anker-solix-api.git /app/solix_web_dashboard/src/solix_api
 
-RUN pip install --no-cache-dir -r requirements.txt
-
+RUN pip install --no-cache-dir -r /app/solix_web_dashboard/requirements.txt
 
 WORKDIR /app/solix_web_dashboard
 
