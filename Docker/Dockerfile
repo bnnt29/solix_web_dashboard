@@ -21,4 +21,4 @@ COPY . .
 # Webserver port
 EXPOSE 8080
 
-CMD ["python", "src/api/pv_monitor.py"]
+CMD ["python", "/solix_web_dashboard/src/api/pv_monitor.py"]
