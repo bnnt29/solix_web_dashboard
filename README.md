@@ -191,3 +191,9 @@ https://github.com/thomluther/anker-solix-api
 ## Disclaimer
 
 Not affiliated with Anker. The API is unofficial and may change at any time. Use at your own risk.
+
+## Example
+![first image](README_images/0.png)
+![second image](README_images/1.png)
+![third image](README_images/2.png)
+![fourth image](README_images/3.png)
