@@ -26,9 +26,9 @@ services:
         "--live-cloud",
         "--energy-stats",
         "--interval",
-        "30",
+        "6",
         "--sample-interval",
-        "10",
+        "3",
         "--storage-root",
         "/app/solix_web_dashboard/src/dashboard/exports/timeseries",
         "--web-folder",
@@ -42,7 +42,8 @@ services:
         "--console-detail",
         "compact",
         "--console-log-level",
-        "INFO"
+        "INFO",
+        "--dashboard-light"
       ]
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/', timeout=5)"]

@@ -27,12 +27,12 @@ EXPOSE 8080
 CMD ["python", "/app/solix_web_dashboard/src/api/pv_monitor.py", \
      "--live-cloud", \
      "--energy-stats", \
-     "--interval", "30", \
-     "--sample-interval", "10", \
+     "--interval", "6", \
+     "--sample-interval", "3", \
      "--storage-root", "/app/solix_web_dashboard/src/dashboard/exports/timeseries", \
      "--web-folder", "/app/solix_web_dashboard/src/dashboard", \
      "--web-host", "0.0.0.0", \
      "--web-port", "8080", \
      "--config", "/app/config/solix-monitor.config.json", \
      "--console-detail", "compact", \
-     "--console-log-level", "INFO"]
+     "--console-log-level", "INFO", "--dashboard-light"]
