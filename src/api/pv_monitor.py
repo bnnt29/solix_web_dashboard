@@ -10,7 +10,11 @@ for long-term time-series storage or later imports into databases.
 Note: When the system owning account is used, more details for the systems and devices can be queried and displayed.
 
 
-python pv_monitor.py --live-cloud --energy-stats --interval 10 --sample-interval 5 --storage-root ../dashboard/exports/timeseries --web-folder ../sdashboard --web-host 0.0.0.0 --web-port 8080
+python src/api/pv_monitor.py --live-cloud --energy-stats --interval 10 --sample-interval 5 --storage-root src/dashboard/exports/timeseries --web-folder src/dashboard --web-host 0.0.0.0 --web-port 8080
+
+
+python src/api/pv_monitor.py --live-cloud --energy-stats --interval 30 --sample-interval 10 --storage-root src/dashboard/exports/timeseries --web-folder src/dashboard --web-host 0.0.0.0 --web-port 8080 --config config/solix-monitor.config.json --console-detail compact --console-log-level INFO
+
 """
 
 import argparse

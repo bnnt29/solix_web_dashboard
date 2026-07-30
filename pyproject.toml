@@ -12,17 +12,15 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "Operating System :: OS Independent",
 ]
-dynamic = [ "dependencies" ]
+dependencies = [
+    "aiohttp>=3.10.11",
+    "aiofiles>=25.1.0",
+    "cryptography>=3.4.8",
+    "paho-mqtt>=2.1.0",
+    "python-dotenv>=1.2.1",
+]
 
 [project.urls]
-"Homepage" = "https://github.com/thomluther/anker-solix-web_dashboard"
-"Bug Tracker" = "https://github.com/thomluther/anker-solix-web_dashboard/issues"
-"Discussions" = "https://github.com/thomluther/anker-solix-web_dashboard/discussions"
-
-
-[tool.poetry.dependencies]
-aiohttp = ">=3.10.11"
-aiofiles = ">=25.1.0"
-cryptography = ">=3.4.8"
-paho-mqtt = ">=2.1.0"
-python-dotenv = ">=1.2.1"
+"Homepage" = "https://github.com/bnnt29/solix_web_dashboard/"
+"Bug Tracker" = "https://github.com/bnnt29/solix_web_dashboard/issues"
+"Discussions" = "https://github.com/bnnt29/solix_web_dashboard/discussions"
