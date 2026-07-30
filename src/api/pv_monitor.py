@@ -13,7 +13,7 @@ Note: When the system owning account is used, more details for the systems and d
 python src/api/pv_monitor.py --live-cloud --energy-stats --interval 10 --sample-interval 5 --storage-root src/dashboard/exports/timeseries --web-folder src/dashboard --web-host 0.0.0.0 --web-port 8080
 
 
-python src/api/pv_monitor.py --live-cloud --energy-stats --interval 30 --sample-interval 10 --storage-root src/dashboard/exports/timeseries --web-folder src/dashboard --web-host 0.0.0.0 --web-port 8080 --config config/solix-monitor.config.json --console-detail compact --console-log-level INFO
+python src/api/pv_monitor.py --live-cloud --energy-stats --interval 6 --sample-interval 3 --storage-root src/dashboard/exports/timeseries --web-folder src/dashboard --web-host 0.0.0.0 --web-port 8080 --config config/solix-monitor.config.json --console-detail compact --console-log-level INFO --dashboard-light
 
 """
 
@@ -97,6 +97,10 @@ DEFAULT_CONFIG: dict = {
         "detail": "compact",
         "log_level": "INFO",
         "show_api_calls": False,
+    },
+
+    "dashboard": {
+        "system_output_cap_w": None
     },
 }
 
@@ -188,6 +192,23 @@ def apply_credentials_from_config(config: dict) -> None:
             if country_value is not None:
                 common._CREDENTIALS["COUNTRY"] = country_value
 
+def positive_number_or_none(value: object) -> int | float | None:
+    """Return value as positive number or None."""
+    if value is None:
+        return None
+
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+
+    if number <= 0:
+        return None
+
+    if number.is_integer():
+        return int(number)
+
+    return number
 
 def get_log_level(level_name: str) -> int:
     """Convert logging level name to numeric logging level."""
@@ -210,7 +231,7 @@ def parse_arguments() -> argparse.Namespace:
         type=int,
         default=30,
         choices=range(5, 601),
-        metavar="[5-600]",
+        metavar="[7-600]",
         help="Refresh interval in seconds (default: 30)",
     )
     parser.add_argument(
@@ -286,8 +307,8 @@ def parse_arguments() -> argparse.Namespace:
         "--sample-interval",
         type=int,
         default=10,
-        choices=range(5, 3601),
-        metavar="[5-3600]",
+        choices=range(3, 3601),
+        metavar="[3-3600]",
         help="Storage sample interval in seconds (default: 10)",
     )
     parser.add_argument(
@@ -317,21 +338,41 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         "--api-retry-interval",
         type=int,
-        default=120,
+        default=30,
         choices=range(30, 3601),
         metavar="[30-3600]",
-        help="Retry delay in seconds after temporary API failures or rate limits (default: 120)",
+        help="Retry delay in seconds after temporary API failures or rate limits (default: 30)",
     )
 
     parser.add_argument(
         "--energy-rate-limit-backoff",
         type=int,
-        default=300,
+        default=120,
         choices=range(60, 7201),
         metavar="[60-7200]",
-        help="Backoff in seconds for energy statistics after energy_analysis rate limits (default: 300)",
+        help="Backoff in seconds for energy statistics after energy_analysis rate limits (default: 120)",
     )
-
+    parser.add_argument(
+        "--dashboard-light",
+        action="store_true",
+        help=(
+            "Use lightweight dashboard mode: refresh live site data frequently, "
+            "but run expensive device/site/energy detail requests only periodically."
+        ),
+    )
+    
+    parser.add_argument(
+        "--full-refresh-interval",
+        type=int,
+        default=10800,
+        choices=range(300, 86401),
+        metavar="[300-86400]",
+        help=(
+            "Interval in seconds for full detail refresh in dashboard-light mode "
+            "(default: 10800 = 3 hours)."
+        ),
+    )
+    
     args = parser.parse_args()
     return args
 
@@ -347,6 +388,7 @@ class AnkerSolixApiMonitor:
         self.config: dict = load_monitor_config(args.config)
         apply_credentials_from_config(self.config)
         console_config = self.config.get("console") or {}
+        dashboard_config = self.config.get("dashboard") or {}
         # Set configuration based on command line arguments
         self.interactive: bool = INTERACTIVE and not args.live_cloud
         self.showApiCalls: bool = (
@@ -390,6 +432,12 @@ class AnkerSolixApiMonitor:
         self.device_names: list = []
         self.device_filter: str | None = args.device_id
         self.energy_stats: bool = args.energy_stats
+        self.system_output_cap_w: int | float | None = positive_number_or_none(
+            dashboard_config.get("system_output_cap_w")
+        )
+        self.dashboard_light: bool = args.dashboard_light
+        self.full_refresh_interval: int = args.full_refresh_interval
+        self.next_full_refresh: datetime | None = None
         self.refresh_interval: int = args.interval
         self.endpoint_limit: int = args.endpoint_limit
         self.debug_http: bool = args.debug_http
@@ -411,7 +459,7 @@ class AnkerSolixApiMonitor:
         self._last_storage_flat: dict[str, object] | None = None
         self._last_storage_write: datetime | None = None
         self._last_storage_path: Path | None = None
-        self.storage_heartbeat_interval: int = 10800
+        self.storage_heartbeat_interval: int = self.full_refresh_interval
         
         self.api_retry_interval: int = args.api_retry_interval
         self.energy_rate_limit_backoff: int = args.energy_rate_limit_backoff
@@ -590,6 +638,10 @@ class AnkerSolixApiMonitor:
         "price_type",
     )
 
+    SITE_DETAILS_KEYS = (
+        "legal_power_limit",
+    )
+    
     DYNAMIC_PRICE_KEYS = (
         "dynamic_price_total",
         "spot_price_mwh",
@@ -851,7 +903,28 @@ class AnkerSolixApiMonitor:
                 site_record["statistics"] = statistics
 
             # Tariff / price information
+                        # Site details, e.g. legal output power limit
             details = site.get("site_details") or {}
+
+            site_details_record = self._pick_storage_keys(
+                details,
+                self.SITE_DETAILS_KEYS,
+            )
+
+            # Fallback from config if API does not provide legal_power_limit.
+            if (
+                "legal_power_limit" not in site_details_record
+                and self.system_output_cap_w is not None
+            ):
+                site_details_record["legal_power_limit"] = self.system_output_cap_w
+                site_details_record["legal_power_limit_source"] = "config"
+
+            elif "legal_power_limit" in site_details_record:
+                site_details_record["legal_power_limit_source"] = "api"
+
+            if site_details_record:
+                site_record["site_details"] = site_details_record
+            # Tariff / price information
             tariff = self._pick_storage_keys(details, self.TARIFF_KEYS)
 
             dynamic_price_details = details.get("dynamic_price_details") or {}
@@ -3881,6 +3954,8 @@ class AnkerSolixApiMonitor:
                 # Run loop to update Solarbank parameters
                 self.next_refr = datetime.now().astimezone()
                 self.next_dev_refr = 0
+                self.next_full_refresh = datetime.now().astimezone()
+
                 site_names: list | None = None
                 startup: bool = True
                 deferred: bool = False
@@ -3966,43 +4041,88 @@ class AnkerSolixApiMonitor:
                             seconds=self.refresh_interval
                         )
                     if self.next_dev_refr < 0:
-                        CONSOLE.info(
-                            "Running device and site details refresh%s...",
-                            ", excluding " + str({SolixDeviceType.VEHICLE.value})
-                            if self.site_selected #or not self.showVehicles
-                            else "",
+                        now = datetime.now().astimezone()
+
+                        full_refresh_due = (
+                            not self.dashboard_light
+                            or self.next_full_refresh is None
+                            or now >= self.next_full_refresh
                         )
-                        # skip Vehicle data if dedicated site selected or vehicles disabled
-                        await self.api.update_device_details(
-                            fromFile=self.use_file,
-                            exclude={SolixDeviceType.VEHICLE.value}
-                            if self.site_selected #or not self.showVehicles
-                            else None,
-                        )
-                        await self.api.update_site_details(fromFile=self.use_file)
-                        # run also energy refresh if requested
-                        if self.energy_stats:
-                            if startup and not self.use_file:
-                                CONSOLE.info("Deferring initial energy details refresh...")
-                                startup = False
-                                deferred = True
-                            else:
-                                if self.energy_refresh_allowed():
-                                    CONSOLE.info("Running energy details refresh...")
-                                    await self.api.update_device_energy(
-                                        fromFile=self.use_file
-                                    )
+
+                        if self.dashboard_light and not full_refresh_due:
+                            CONSOLE.info(
+                                "Dashboard-light mode: skipping expensive detail refresh. "
+                                "Next full refresh at %s.",
+                                self.next_full_refresh.strftime("%Y-%m-%d %H:%M:%S %Z")
+                                if self.next_full_refresh
+                                else "unknown",
+                            )
+
+                            self.next_refr = datetime.now().astimezone() + timedelta(
+                                seconds=self.refresh_interval
+                            )
+                            self.next_dev_refr = details_refresh
+
+                        else:
+                            CONSOLE.info(
+                                "%s device and site details refresh%s...",
+                                "Running periodic full" if self.dashboard_light else "Running",
+                                ", excluding " + str({SolixDeviceType.VEHICLE.value})
+                                if self.site_selected
+                                else "",
+                            )
+
+                            await self.api.update_site_details(fromFile=self.use_file)
+                            
+                            # skip Vehicle data if dedicated site selected
+                            await self.api.update_device_details(
+                                fromFile=self.use_file,
+                                exclude={SolixDeviceType.VEHICLE.value}
+                                if self.site_selected
+                                else None,
+                            )
+                            
+                            # run also energy refresh if requested
+                            if self.energy_stats:
+                                if startup and not self.use_file and not self.dashboard_light:
+                                    CONSOLE.info("Deferring initial energy details refresh...")
+                                    startup = False
+                                    deferred = True
                                 else:
-                                    CONSOLE.warning(
-                                        "Skipping energy details refresh due to energy_analysis backoff."
-                                    )
+                                    if self.energy_refresh_allowed():
+                                        CONSOLE.info("Running energy details refresh...")
+                                        await self.api.update_device_energy(
+                                            fromFile=self.use_file
+                                        )
+                                    else:
+                                        CONSOLE.warning(
+                                            "Skipping energy details refresh due to energy_analysis backoff."
+                                        )
 
-                                startup = False
-                        self.next_refr = datetime.now().astimezone() + timedelta(
-                            seconds=self.refresh_interval
-                        )
-                        self.next_dev_refr = details_refresh
+                                    startup = False
 
+                            if self.dashboard_light:
+                                self.next_full_refresh = (
+                                    datetime.now().astimezone()
+                                    + timedelta(seconds=self.full_refresh_interval)
+                                )
+
+                                # Force the next storage write to be a full JSONL snapshot.
+                                # This makes sure the periodic full API data is persisted as a full record.
+                                self._last_storage_flat = None
+
+                                CONSOLE.info(
+                                    "Next periodic full refresh scheduled at %s.",
+                                    self.next_full_refresh.strftime("%Y-%m-%d %H:%M:%S %Z"),
+                                )
+
+                                # Optional but useful: immediately persist the full refresh result.
+                                await self.write_storage_snapshot()
+
+                            self.next_refr = datetime.now().astimezone() + timedelta(
+                                seconds=self.refresh_interval
+                            )
+                            self.next_dev_refr = details_refresh
                         # Auto-start MQTT session if enabled via command line
                         '''
                         if (

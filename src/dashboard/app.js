@@ -168,18 +168,34 @@ const state = {
   monthlyKnownMonths: null,
 };
 
-const SYSTEM_OUTPUT_CAP_W = 800;
+const FALLBACK_SYSTEM_OUTPUT_CAP_W = null;
+
+function getSystemOutputCapW() {
+  const found = findLatest([
+    "site_details.legal_power_limit",
+    "legal_power_limit",
+  ]);
+
+  const value = found ? toNumber(found.value) : null;
+
+  if (value !== null && value > 0) {
+    return value;
+  }
+
+  return FALLBACK_SYSTEM_OUTPUT_CAP_W;
+}
 
 function formatOutputCap(valueText) {
   const value = toNumber(String(valueText).replace(" W", ""));
+  const cap = getSystemOutputCapW();
 
-  if (value === null) {
+  if (value === null || cap === null || cap <= 0) {
     return t("systemOutputSub");
   }
 
-  const percent = Math.min(999, (value / SYSTEM_OUTPUT_CAP_W) * 100);
+  const percent = Math.min(999, (value / cap) * 100);
 
-  return `${formatValue(String(value), "W")} / ${SYSTEM_OUTPUT_CAP_W} W · ${percent.toFixed(0)} %`;
+  return `${formatValue(String(value), "W")} / ${cap.toFixed(0)} W · ${percent.toFixed(0)} %`;
 }
 
 const $ = (id) => document.getElementById(id);
@@ -195,7 +211,7 @@ const els = {
   pvPower: $("pvPower"),
   pvSub: $("pvSub"),
   systemOutputPower: $("systemOutputPower"),
-systemOutputSub: $("systemOutputSub"),
+  systemOutputSub: $("systemOutputSub"),
   homeLoad: $("homeLoad"),
   homeSub: $("homeSub"),
   batterySoc: $("batterySoc"),
@@ -1771,17 +1787,29 @@ function updateDashboard() {
   ], "W");
   const systemOutputRaw = findLatest([
     "solarbank_info.to_home_load",
+    "solarbank_info.total_home_load_power",
     "solarbank_info.total_output_power",
+
+    "solarbank_pps_info.to_home_load",
+    "solarbank_pps_info.total_home_load_power",
+    "solarbank_pps_info.total_output_power",
+
     "to_home_load",
     "output_power",
+
     "mqtt.output_power",
     "mqtt.ac_output_power",
-    ]);
+    "mqtt.ac_output_power_signed",
+  ]);
   const systemOutputNumber = systemOutputRaw
     ? toNumber(systemOutputRaw.value)
     : null;
   const home = getFormatted([
     "home_load_power",
+    "solarbank_info.to_home_load",
+    "solarbank_info.total_home_load_power",
+    "solarbank_pps_info.to_home_load",
+    "solarbank_pps_info.total_home_load_power",
     "other_loads_power",
     "grid_to_home_power",
   ], "W");
@@ -1813,9 +1841,17 @@ function updateDashboard() {
   const savings = findSiteStatisticByType("3", 2);
 
   els.pvPower.textContent = pv;
-  els.systemOutputSub.textContent = systemOutputNumber === null
-  ? t("systemOutputSub")
-  : `${systemOutputNumber.toFixed(0)} W ${t("ofLimit")} ${SYSTEM_OUTPUT_CAP_W} W · ${((systemOutputNumber / SYSTEM_OUTPUT_CAP_W) * 100).toFixed(0)} %`;
+  const systemOutputCapW = getSystemOutputCapW();
+  els.systemOutputPower.textContent =
+    systemOutputNumber === null
+      ? "—"
+      : `${systemOutputNumber.toFixed(0)} W`;
+  els.systemOutputSub.textContent =
+    systemOutputNumber !== null &&
+    systemOutputCapW !== null &&
+    systemOutputCapW > 0
+      ? `${t("ofLimit")} ${systemOutputCapW.toFixed(0)} W · ${((systemOutputNumber / systemOutputCapW) * 100).toFixed(0)} %`
+      : t("systemOutputSub");
   els.homeLoad.textContent = home;
   els.batterySoc.textContent = batterySoc;
   els.batteryPower.textContent =
@@ -2404,8 +2440,8 @@ function renderChartInsights(datasets) {
 
     return `
       <div class="insight-card">
-        <div class="insight-title" title="${escapeHtml(dataset.label)}">
-          ${escapeHtml(dataset.label)}
+        <div class="insight-title" title="${escapeHtml(dataset.label.replace(/\[.*?\]/g, '').trim())}">
+          ${escapeHtml(dataset.label.replace(/\[.*?\]/g, '').trim())}
         </div>
         <div class="insight-main">${escapeHtml(formatCompact(latest, dataset.unit))}</div>
         <div class="insight-sub">
@@ -2495,27 +2531,47 @@ function updateChart() {
                 boxHeight: 8,
             },
             onClick(event, legendItem, legend) {
-                const chart = legend.chart;
-                const datasetIndex = legendItem.datasetIndex;
-                const dataset = chart.data.datasets[datasetIndex];
+              const chart = legend.chart;
+              const dsIdx = legendItem.datasetIndex;
+              const ds = chart.data.datasets[dsIdx];
+              if (!ds) return;
 
-                if (!dataset) return;
+              // 1️⃣ Sichtbarkeit umschalten
+              const newVis = !chart.isDatasetVisible(dsIdx);
+              chart.setDatasetVisibility(dsIdx, newVis);
 
-                const currentlyVisible = chart.isDatasetVisible(datasetIndex);
-                const nextVisible = !currentlyVisible;
+              // 2️⃣ hidden‑Set für persisten‑Verhalten aktualisieren
+              if (ds.seriesId) {
+                  if (newVis) {
+                      state.hiddenSeries.delete(ds.seriesId);
+                  } else {
+                      state.hiddenSeries.add(ds.seriesId);
+                  }
+              }
 
-                chart.setDatasetVisibility(datasetIndex, nextVisible);
+              // 3️⃣ Welche Achsen werden noch verwendet?
+              const usedAxes = new Set();
+              chart.data.datasets.forEach((d, i) => {
+                  if (chart.isDatasetVisible(i)) {
+                      usedAxes.add(d.yAxisID);
+                  }
+              });
 
-                if (dataset.seriesId) {
-                    if (nextVisible) {
-                        state.hiddenSeries.delete(dataset.seriesId);
-                    } else {
-                        state.hiddenSeries.add(dataset.seriesId);
-                    }
-                }
+              // 4️⃣ Achsen‑Visibility anpassen
+              Object.keys(chart.options.scales).forEach((axisId) => {
+                  // Achsen, die nicht im Chart definiert sind (z. B. x‑Axis) ignorieren
+                  if (!chart.options.scales[axisId]) return;
 
-                chart.update();
-            },
+                  // Nur Achsen vom Typ "linear" (y‑Achsen) betreffen
+                  const isY = ["power", "percent", "energy"].includes(axisId);
+                  if (isY) {
+                      chart.options.scales[axisId].display = usedAxes.has(axisId);
+                  }
+              });
+
+              // 5️⃣ Diagramm neu rendern
+              chart.update();
+          },
         },
         tooltip: {
           backgroundColor: "rgba(3, 9, 22, 0.95)",
@@ -2570,7 +2626,10 @@ function updateChart() {
                 maxTicksLimit: compactChart ? 4 : 8,
                 padding: compactChart ? 2 : 6,
                 callback(value) {
-                return compactChart ? formatAxisTick(value) : value;
+                    const formatted = compactChart ? formatAxisTick(value) : value;
+                    // Einheit für die jeweilige Achse bestimmen
+                    const unit = "W";          // Power‑Achse → Watt
+                    return `${formatted} ${unit}`;
                 },
             },
             grid: {
@@ -2593,7 +2652,9 @@ function updateChart() {
                 maxTicksLimit: compactChart ? 4 : 8,
                 padding: compactChart ? 2 : 6,
                 callback(value) {
-                return compactChart ? formatAxisTick(value) : value;
+                    const formatted = compactChart ? formatAxisTick(value) : value;
+                    const unit = "%";         // Prozent‑Achse
+                    return `${formatted}${unit}`;   // kein Leerzeichen bei Prozent
                 },
             },
             grid: {
@@ -2614,7 +2675,9 @@ function updateChart() {
                 maxTicksLimit: compactChart ? 4 : 8,
                 padding: compactChart ? 2 : 6,
                 callback(value) {
-                return compactChart ? formatAxisTick(value) : value;
+                    const formatted = compactChart ? formatAxisTick(value) : value;
+                    const unit = "kWh";       // Energie‑Achse
+                    return `${formatted} ${unit}`;
                 },
             },
             grid: {
