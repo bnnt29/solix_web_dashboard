@@ -14,7 +14,7 @@ services:
 
     volumes:
       # Credentials/config from host
-      - ./config/solix-monitor.config.json:/app/solix_web_dashboard/config/solix-monitor.config.json:ro
+      - ./config:/app/solix_web_dashboard/config:ro
 
       # Persistent time-series data, served by the webserver below /exports/timeseries
       - ./data/timeseries:/app/solix_web_dashboard/src/dashboard/exports/timeseries
@@ -22,7 +22,7 @@ services:
     command:
       [
         "python",
-        "src/api/pv_monitor.py",
+        "/app/solix_web_dashboard/src/api/pv_monitor.py",
         "--live-cloud",
         "--energy-stats",
         "--interval",
@@ -30,9 +30,9 @@ services:
         "--sample-interval",
         "10",
         "--storage-root",
-        "src/dashboard/exports/timeseries",
+        "/app/solix_web_dashboard/src/dashboard/exports/timeseries",
         "--web-folder",
-        "src/dashboard",
+        "/app/solix_web_dashboard/src/dashboard",
         "--web-host",
         "0.0.0.0",
         "--web-port",
