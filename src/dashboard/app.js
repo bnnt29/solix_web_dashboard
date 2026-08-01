@@ -492,6 +492,12 @@ const CHART_GROUPS = {
             "to_home_load",
             "output_power",
         ],
+        capBySuffixes: [
+          "solarbank_info.total_photovoltaic_power",
+          "solarbank_info.total_pv_input_power",
+          "photovoltaic_power",
+          "input_power",
+        ],
         unit: "W",
         axis: "power",
         color: "#ffd166",
@@ -1564,39 +1570,15 @@ async function fetchMonthlyManifest() {
   }
 }
 
-async function monthKeysForCurrentRange() {
+async function monthKeysForAvailableHistory() {
   const now = new Date();
-  const bounds = getNominalRangeBounds(state.chartRange);
+  const manifestMonths = await fetchMonthlyManifest();
 
-  if (state.chartRange === "all") {
-    const manifestMonths = await fetchMonthlyManifest();
-
-    if (manifestMonths.length) {
-      return manifestMonths;
-    }
-
-    return monthKeysBetween(configuredStartDate(), now);
+  if (manifestMonths.length) {
+    return manifestMonths;
   }
 
-  if (state.chartRange === "currentYear") {
-    return monthKeysBetween(
-      new Date(now.getFullYear(), 0, 1, 0, 0, 0, 0),
-      now
-    );
-  }
-
-  if (state.chartRange === "last365d") {
-    return monthKeysBetween(
-      new Date(now.getTime() - 365 * 24 * 60 * 60 * 1000),
-      now
-    );
-  }
-
-  if (bounds.min !== null) {
-    return monthKeysBetween(new Date(bounds.min), now);
-  }
-
-  return [currentMonthKey()];
+  return monthKeysBetween(configuredStartDate(), now);
 }
 
 async function fetchMonthlyJsonl(monthKey, { force = false, required = false } = {}) {
@@ -2050,9 +2032,13 @@ function buildDataset(definition, index, snapshots) {
         return null;
       }
 
+      const cap = definition.capKey
+        ? toNumber(snapshot.values[definition.capKey])
+        : null;
+
       return {
         x: snapshot.time,
-        y: number,
+        y: cap === null ? number : Math.min(number, Math.max(0, cap)),
       };
     })
     .filter(Boolean);
@@ -2417,9 +2403,14 @@ function getChartSeriesDefinitions() {
         return null;
       }
 
+      const capKey = definition.capBySuffixes
+        ? resolveSeriesKey(definition.capBySuffixes)
+        : null;
+
       return {
         ...definition,
         key,
+        capKey,
       };
     })
     .filter(Boolean);
@@ -2907,7 +2898,7 @@ async function loadDefaultFromExports({ force = false, silent = false } = {}) {
   state.isLoadingRemote = true;
 
   try {
-    const monthKeys = await monthKeysForCurrentRange();
+    const monthKeys = await monthKeysForAvailableHistory();
 
     if (!monthKeys.length) {
       throw new Error("No monthly export files configured.");
