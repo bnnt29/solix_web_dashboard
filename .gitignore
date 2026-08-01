@@ -223,6 +223,9 @@ src/dashboard/exports
 src/dashboard/exports/
 src/dashboard/exports/*
 
-/exports
-/exports/
-/exports/*
+exports
+exports/
+exports/*
+data
+data/
+data/*
