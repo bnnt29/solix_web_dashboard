@@ -2026,7 +2026,6 @@ function applyHouseContributionPercentages(datasets) {
     return;
   }
 
-  const totalDataset = datasets.find((dataset) => dataset.houseTotal);
   const contributionDatasets = datasets.filter((dataset) => dataset.houseContribution);
 
   if (!contributionDatasets.length) {
@@ -2038,32 +2037,23 @@ function applyHouseContributionPercentages(datasets) {
   let contributionSumKWh = 0;
 
   for (const dataset of contributionDatasets) {
-    const kWh = estimateEnergyKWh(dataset.data) || 0;
+    const consumptionPoints = dataset.data.map((point) => ({
+      ...point,
+      y: Math.max(0, point.y),
+    }));
+    const kWh = estimateEnergyKWh(consumptionPoints) || 0;
 
     contributionEnergy.set(dataset.seriesId, kWh);
     contributionSumKWh += kWh;
   }
 
-  /*
-    Prefer Home Load as denominator.
-    If unavailable or 0, fall back to the sum of the source contributions.
-  */
-  const totalHouseKWh = totalDataset
-    ? estimateEnergyKWh(totalDataset.data)
-    : null;
-
-  const denominatorKWh =
-    totalHouseKWh && totalHouseKWh > 0
-      ? totalHouseKWh
-      : contributionSumKWh;
-
-  if (!denominatorKWh || denominatorKWh <= 0) {
+  if (contributionSumKWh <= 0) {
     return;
   }
 
   for (const dataset of contributionDatasets) {
     const kWh = contributionEnergy.get(dataset.seriesId) || 0;
-    const percent = (kWh / denominatorKWh) * 100;
+    const percent = (kWh / contributionSumKWh) * 100;
 
     dataset.houseContributionKWh = kWh;
     dataset.houseContributionPercent = percent;
