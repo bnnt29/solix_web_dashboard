@@ -4,9 +4,13 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONPATH=/app/solix_web_dashboard/src:/app/solix_web_dashboard/src/api
 
+RUN useradd --create-home --uid 10001 appuser
+USER appuser
+
 WORKDIR /app
 
 RUN apt-get update \
+    && apt-get upgrade -y --no-install-recommends \
     && apt-get install -y --no-install-recommends gcc build-essential git \
     && rm -rf /var/lib/apt/lists/*
 

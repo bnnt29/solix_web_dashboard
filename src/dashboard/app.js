@@ -1033,6 +1033,14 @@ function getFlowValues() {
       ? Math.min(pv, charge)
       : null;
 
+  const pvGridValue =
+    isPositiveWatts(pv) && isPositiveWatts(exportPower)
+      ? Math.min(
+          exportPower,
+          Math.max(0, pv - (pvHomeValue || 0) - (pvBatteryValue || 0))
+        )
+      : null;
+
   return {
     pvHome: {
       value: pvHomeValue,
@@ -1051,9 +1059,9 @@ function getFlowValues() {
     },
 
     pvGrid: {
-      value: exportPower,
-      active: isPositiveWatts(exportPower),
-      label: formatWatts(exportPower),
+      value: pvGridValue,
+      active: isPositiveWatts(pvGridValue),
+      label: formatWatts(pvGridValue),
       source: pvToGrid ? pvToGrid.key : null,
     },
 
