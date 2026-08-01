@@ -13,8 +13,11 @@ RUN apt-get update \
 
 EXPOSE 8080
 
+VOLUME ["/app/config"]
+
 RUN useradd --create-home --uid 10001 appuser \
-    && chown appuser:appuser /app
+    && mkdir -p /app/config \
+    && chown -R appuser:appuser /app /app/config
 
 # Clone dashboard
 RUN git clone --recurse-submodules https://github.com/bnnt29/solix_web_dashboard.git /app/solix_web_dashboard
@@ -34,6 +37,6 @@ CMD ["python", "/app/solix_web_dashboard/src/api/pv_monitor.py", \
      "--web-folder", "/app/solix_web_dashboard/src/dashboard", \
      "--web-host", "0.0.0.0", \
      "--web-port", "8080", \
-    "--config", "/app/solix_web_dashboard/config/solix-monitor.config.json", \
+    "--config", "/app/config/solix-monitor.config.json", \
      "--console-detail", "compact", \
      "--console-log-level", "INFO", "--dashboard-light"]
