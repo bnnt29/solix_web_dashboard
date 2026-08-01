@@ -4,9 +4,6 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONPATH=/app/solix_web_dashboard/src:/app/solix_web_dashboard/src/api
 
-RUN useradd --create-home --uid 10001 appuser
-USER appuser
-
 WORKDIR /app
 
 RUN apt-get update \
@@ -14,19 +11,18 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends gcc build-essential git \
     && rm -rf /var/lib/apt/lists/*
 
+EXPOSE 8080
+
+RUN useradd --create-home --uid 10001 appuser \
+    && chown appuser:appuser /app
+USER appuser
+
 # Clone dashboard
 RUN git clone --recurse-submodules https://github.com/bnnt29/solix_web_dashboard.git /app/solix_web_dashboard
-
-# Clone missing solix_api dependency into the exact path expected by pv_monitor.py
-RUN rm -rf /app/solix_web_dashboard/src/solix_api \
-    && git clone https://github.com/thomluther/anker-solix-api.git /app/solix_web_dashboard/src/solix_api
 
 RUN pip install --no-cache-dir -r /app/solix_web_dashboard/Docker/requirements.txt
 
 WORKDIR /app/solix_web_dashboard
-
-
-EXPOSE 8080
 
 CMD ["python", "/app/solix_web_dashboard/src/api/pv_monitor.py", \
      "--live-cloud", \
