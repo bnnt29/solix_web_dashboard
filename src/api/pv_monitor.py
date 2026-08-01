@@ -100,7 +100,10 @@ DEFAULT_CONFIG: dict = {
     },
 
     "dashboard": {
-        "system_output_cap_w": None
+        "system_output_cap_w": None,
+        "pause_data_crawler": False,
+        "grid_import_price_per_kwh": None,
+        "grid_export_price_per_kwh": None,
     },
 }
 
@@ -385,7 +388,8 @@ class AnkerSolixApiMonitor:
         # Parse command line arguments if not provided
         if not isinstance(args, argparse.Namespace):
             args = parse_arguments()
-        self.config: dict = load_monitor_config(args.config)
+        self.config_path: Path = args.config.expanduser()
+        self.config: dict = load_monitor_config(self.config_path)
         apply_credentials_from_config(self.config)
         console_config = self.config.get("console") or {}
         dashboard_config = self.config.get("dashboard") or {}
@@ -434,6 +438,9 @@ class AnkerSolixApiMonitor:
         self.energy_stats: bool = args.energy_stats
         self.system_output_cap_w: int | float | None = positive_number_or_none(
             dashboard_config.get("system_output_cap_w")
+        )
+        self.pause_data_crawler: bool = bool(
+            dashboard_config.get("pause_data_crawler", False)
         )
         self.dashboard_light: bool = args.dashboard_light
         self.full_refresh_interval: int = args.full_refresh_interval
@@ -3919,7 +3926,11 @@ class AnkerSolixApiMonitor:
                     websession,
                     api_logger,
                 )
-                if self.use_file:
+                if self.pause_data_crawler:
+                    CONSOLE.warning(
+                        "Data crawler paused by dashboard.pause_data_crawler."
+                    )
+                elif self.use_file:
                     # set the correct test folder for Api
                     self.api.testDir(self.folderdict.get("folder"))
                 elif await self.api.async_authenticate():
@@ -3936,6 +3947,10 @@ class AnkerSolixApiMonitor:
 
                 # Start optional static webserver
                 await self.start_webserver()
+                if self.pause_data_crawler:
+                    while True:
+                        await asyncio.sleep(3600)
+
                 if self.interactive:
                     while True:
                         resp = await self.async_inupt(
@@ -4350,10 +4365,36 @@ class AnkerSolixApiMonitor:
 
             return web.FileResponse(index_file)
 
+        async def serve_dashboard_config(request: web.Request) -> web.Response:
+            current_config = load_monitor_config(self.config_path)
+            dashboard_config = current_config.get("dashboard") or {}
+            public_config = {
+                "systemOutputCapW": dashboard_config.get(
+                    "system_output_cap_w"
+                ),
+                "gridImportPricePerKwh": dashboard_config.get(
+                    "grid_import_price_per_kwh"
+                ),
+                "gridExportPricePerKwh": dashboard_config.get(
+                    "grid_export_price_per_kwh"
+                ),
+            }
+            script = (
+                "window.DASHBOARD_CONFIG = Object.assign("
+                "{}, window.DASHBOARD_CONFIG || {}, "
+                f"{json.dumps(public_config, separators=(',', ':'))});"
+            )
+            return web.Response(
+                text=script,
+                content_type="application/javascript",
+                headers={"Cache-Control": "no-store"},
+            )
+
         # Explicitly serve index.html for the root URL.
         app.router.add_get("/", serve_index)
         app.router.add_get("/index.html", serve_index)
         app.router.add_get("/api/updates", stream_updates)
+        app.router.add_get("/api/dashboard-config.js", serve_dashboard_config)
 
         # Serve all other static files from the selected folder.
         app.router.add_static(

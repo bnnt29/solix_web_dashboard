@@ -183,7 +183,8 @@ const state = {
   monthlyKnownMonths: null,
 };
 
-const FALLBACK_SYSTEM_OUTPUT_CAP_W = null;
+const FALLBACK_SYSTEM_OUTPUT_CAP_W =
+  toNumber(DASHBOARD_CONFIG.systemOutputCapW);
 
 function getSystemOutputCapW() {
   const found = findLatest([
@@ -257,6 +258,7 @@ const els = {
   totalGenerated: $("totalGenerated"),
   co2Saved: $("co2Saved"),
   moneySaved: $("moneySaved"),
+  exportLoss: $("exportLoss"),
 };
 
 const COLORS = [
@@ -1002,6 +1004,11 @@ function getFlowValues() {
     "bat_discharge_power",
   ]);
 
+  const pvToGrid = firstNumberBySuffixes([
+    "photovoltaic_to_grid_power",
+    "mqtt.pv_to_grid_power",
+  ]);
+
   const gridToHome = firstNumberBySuffixes([
     "grid_to_home_power",
     "mqtt.grid_to_home_power",
@@ -1013,6 +1020,7 @@ function getFlowValues() {
   const toHome = pvToHome ? pvToHome.value : null;
   const charge = batteryCharge ? batteryCharge.value : null;
   const discharge = batteryDischarge ? batteryDischarge.value : null;
+  const exportPower = pvToGrid ? pvToGrid.value : null;
   const grid = gridToHome ? gridToHome.value : null;
 
   const pvHomeValue =
@@ -1040,6 +1048,13 @@ function getFlowValues() {
       label: formatWatts(pvBatteryValue),
       source: batteryCharge ? batteryCharge.key : null,
       pvSource: pvPower ? pvPower.key : null,
+    },
+
+    pvGrid: {
+      value: exportPower,
+      active: isPositiveWatts(exportPower),
+      label: formatWatts(exportPower),
+      source: pvToGrid ? pvToGrid.key : null,
     },
 
     batteryHome: {
@@ -1264,6 +1279,13 @@ function updateFlowLines() {
     0.38
   );
 
+  const pvGrid = connectCurve(
+    document.getElementById("pathPvGrid"),
+    pv,
+    grid,
+    0.38
+  );
+
   const batteryHome = connectStraight(
     document.getElementById("pathBatteryHome"),
     battery,
@@ -1279,6 +1301,7 @@ function updateFlowLines() {
 
   setFlowActive("pathPvHome", "labelPvHome", flows.pvHome.active);
   setFlowActive("pathPvBattery", "labelPvBattery", flows.pvBattery.active);
+  setFlowActive("pathPvGrid", "labelPvGrid", flows.pvGrid.active);
   setFlowActive("pathBatteryHome", "labelBatteryHome", flows.batteryHome.active);
   setFlowActive("pathGridHome", "labelGridHome", flows.gridHome.active);
 
@@ -1301,6 +1324,16 @@ if (flows.pvBattery.active) {
     compactFlow
       ? offsetPoint(pvBattery.label, -18, 0)
       : offsetPoint(pvBattery.label, -28, -10)
+  );
+}
+
+if (flows.pvGrid.active) {
+  setFlowLabel(
+    "labelPvGrid",
+    flows.pvGrid.label,
+    compactFlow
+      ? offsetPoint(pvGrid.label, 18, 0)
+      : offsetPoint(pvGrid.label, 28, -10)
   );
 }
 
@@ -1853,7 +1886,6 @@ function updateDashboard() {
 
   const generated = findSiteStatisticByType("1", 0);
   const co2 = findSiteStatisticByType("2", 1);
-  const savings = findSiteStatisticByType("3", 2);
 
   els.pvPower.textContent = pv;
   const systemOutputCapW = getSystemOutputCapW();
@@ -1917,7 +1949,27 @@ function updateDashboard() {
   }
 
   if (els.moneySaved) {
-    els.moneySaved.textContent = formatStatistic(savings);
+    const generatedKWh = generated ? toNumber(generated.total) : null;
+    const importPrice = toNumber(DASHBOARD_CONFIG.gridImportPricePerKwh);
+
+    els.moneySaved.textContent =
+      generatedKWh === null || importPrice === null
+        ? "—"
+        : `${(generatedKWh * importPrice).toFixed(2)} €`;
+  }
+
+  if (els.exportLoss) {
+    const exportedKWh = toNumber(getValue([
+      "energy_details.today.solar_to_grid",
+      "energy_details.today.grid_export",
+    ]));
+    const importPrice = toNumber(DASHBOARD_CONFIG.gridImportPricePerKwh);
+    const exportPrice = toNumber(DASHBOARD_CONFIG.gridExportPricePerKwh);
+
+    els.exportLoss.textContent =
+      exportedKWh === null || importPrice === null || exportPrice === null
+        ? "—"
+        : `${(exportedKWh * Math.max(0, importPrice - exportPrice)).toFixed(2)} €`;
   }
   updateFlowLines();
 }

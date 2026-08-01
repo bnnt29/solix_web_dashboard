@@ -127,6 +127,7 @@
 
             <path id="pathPvHome" class="flow-path flow-path-main flow-path-solar" />
             <path id="pathPvBattery" class="flow-path flow-path-solar" />
+            <path id="pathPvGrid" class="flow-path flow-path-grid" />
             <path id="pathBatteryHome" class="flow-path flow-path-battery" />
             <path id="pathGridHome" class="flow-path flow-path-grid" />
 
@@ -136,6 +137,11 @@
             </g>
 
             <g id="labelPvBattery" class="flow-label">
+              <rect />
+              <text></text>
+            </g>
+
+            <g id="labelPvGrid" class="flow-label">
               <rect />
               <text></text>
             </g>
@@ -235,6 +241,13 @@
             <strong id="moneySaved">—</strong>
             <small data-i18n="moneySavedSub">Estimated savings</small>
         </article>
+
+        <article class="kpi-card stat-export-loss">
+          <span class="kpi-icon">€</span>
+          <span class="kpi-label" data-i18n="exportLoss">Export loss</span>
+          <strong id="exportLoss">—</strong>
+          <small data-i18n="exportLossSub">Lost value from solar export today</small>
+        </article>
     </section>
 
     <section class="panel chart-panel">
@@ -323,6 +336,7 @@
     startYear: 2026
   };
 </script>
+  <script src="/api/dashboard-config.js"></script>
   <script src="i18n.js"></script>
   <script src="app.js"></script>
 </body>

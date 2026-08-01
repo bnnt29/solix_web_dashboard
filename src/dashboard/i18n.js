@@ -156,9 +156,11 @@ houseEnergy: "House energy",
 totalGenerated: "Generated",
 co2Saved: "CO₂ saved",
 moneySaved: "Saved",
+exportLoss: "Export loss",
 totalGeneratedSub: "Total produced energy",
 co2SavedSub: "Avoided emissions",
 moneySavedSub: "Estimated savings",
+exportLossSub: "Lost value from solar export today",
   },
 
   de: {
@@ -316,9 +318,11 @@ houseEnergy: "Hausenergie",
 totalGenerated: "Erzeugt",
 co2Saved: "CO₂-Einsparung",
 moneySaved: "Eingespart",
+exportLoss: "Einspeiseverlust",
 totalGeneratedSub: "Gesamte erzeugte Energie",
 co2SavedSub: "Vermiedene Emissionen",
 moneySavedSub: "Geschätzte Ersparnis",
+exportLossSub: "Entgangener Wert durch heutige Einspeisung",
   },
 };
 
