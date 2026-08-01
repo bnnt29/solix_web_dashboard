@@ -1967,10 +1967,7 @@ function updateDashboard() {
   }
 
   if (els.exportLoss) {
-    const exportedKWh = toNumber(getValue([
-      "energy_details.today.solar_to_grid",
-      "energy_details.today.grid_export",
-    ]));
+    const exportedKWh = getGridExportEnergyEstimate();
     const importPrice = toNumber(DASHBOARD_CONFIG.gridImportPricePerKwh);
     const exportPrice = toNumber(DASHBOARD_CONFIG.gridExportPricePerKwh);
 
@@ -2466,6 +2463,25 @@ function estimateEnergyKWh(points) {
   }
 
   return wh / 1000;
+}
+
+function getGridExportEnergyEstimate() {
+  const definition = CHART_GROUPS.grid.summary.find(
+    (series) => series.labelKey === "gridExport"
+  );
+  const key = definition ? resolveSeriesKey(definition.suffixes) : null;
+
+  if (!definition || !key) {
+    return null;
+  }
+
+  const dataset = buildDataset(
+    { ...definition, key },
+    0,
+    state.snapshots
+  );
+
+  return estimateEnergyKWh(dataset.data);
 }
 
 function seriesDelta(points) {
