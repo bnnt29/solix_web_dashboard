@@ -12,12 +12,14 @@ services:
       PYTHONUNBUFFERED: "1"
       PYTHONPATH: "/app/solix_web_dashboard/src:/app/solix_web_dashboard/src/api"
 
+    user: "${UID:-1000}:${GID:-1000}"
+
     volumes:
       # Credentials/config from host
-      - ./config:/app/solix_web_dashboard/config:ro
+      - ../config:/app/solix_web_dashboard/config:ro
 
       # Persistent time-series data, served by the webserver below /exports/timeseries
-      - ./data/timeseries:/app/solix_web_dashboard/src/dashboard/exports/timeseries
+      - ../data/timeseries:/app/solix_web_dashboard/src/dashboard/exports/timeseries
 
     command:
       [
