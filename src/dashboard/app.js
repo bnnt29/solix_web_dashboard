@@ -1990,7 +1990,10 @@ function cleanLabel(key) {
     .replace(/energy_details\./g, "")
     .replace(/\./g, " · ")
     .replace(/_/g, " ")
-    .replace(/\b\w/g, (char) => char.toUpperCase());
+    .replace(
+      /(^|[\s·])(\p{L})/gu,
+      (_, separator, char) => `${separator}${char.toUpperCase()}`
+    );
 }
 
 function selectChartGroup(groupName) {
@@ -2812,6 +2815,21 @@ function renderMetricList() {
       renderMetricList();
     });
   });
+
+  fitMetricTitles();
+}
+
+function fitMetricTitles() {
+  els.metricList.querySelectorAll(".metric-title").forEach((title) => {
+    title.style.removeProperty("font-size");
+
+    let fontSize = Number.parseFloat(getComputedStyle(title).fontSize);
+
+    while (title.scrollWidth > title.clientWidth && fontSize > 10) {
+      fontSize -= 0.5;
+      title.style.fontSize = `${fontSize}px`;
+    }
+  });
 }
 
 function loadText(text, sourceName = "JSONL") {
@@ -3044,6 +3062,7 @@ function initEvents() {
         window.history.replaceState({}, "", url);
         
         applyTranslations();
+        buildLabels();
         updateDashboard();
         updateChart();
         renderMetricList();
@@ -3058,6 +3077,7 @@ function initEvents() {
         updateChart();
         updateFlowLines();
         updateScrollableFades();
+        fitMetricTitles();
     }, 150);
   });
 }

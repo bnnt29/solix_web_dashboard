@@ -918,6 +918,10 @@ p {
   accent-color: var(--cyan);
 }
 
+.metric-item > span {
+  min-width: 0;
+}
+
 .metric-title {
   color: var(--text);
   font-weight: 700;
