@@ -2520,7 +2520,7 @@ function renderChartInsights(datasets) {
         ${
             dataset.houseContributionPercent !== null &&
             dataset.houseContributionPercent !== undefined
-            ? `<br />${escapeHtml(t("houseShare"))}: ${escapeHtml(dataset.houseContributionPercent.toFixed(1))} % · ${escapeHtml(formatCompact(dataset.houseContributionKWh, "kWh"))}`
+            ? `<br />${escapeHtml(t("houseShare"))}: ${escapeHtml(dataset.houseContributionPercent.toFixed(1))} %`
             : ""
         }
         </div>
