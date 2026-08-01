@@ -222,3 +222,7 @@ solix-monitor.config.json
 src/dashboard/exports
 src/dashboard/exports/
 src/dashboard/exports/*
+
+/exports
+/exports/
+/exports/*
