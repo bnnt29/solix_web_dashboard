@@ -15,13 +15,13 @@ EXPOSE 8080
 
 RUN useradd --create-home --uid 10001 appuser \
     && chown appuser:appuser /app
-USER appuser
 
 # Clone dashboard
 RUN git clone --recurse-submodules https://github.com/bnnt29/solix_web_dashboard.git /app/solix_web_dashboard
 
 RUN pip install --no-cache-dir -r /app/solix_web_dashboard/Docker/requirements.txt
 
+USER appuser
 WORKDIR /app/solix_web_dashboard
 
 CMD ["python", "/app/solix_web_dashboard/src/api/pv_monitor.py", \
