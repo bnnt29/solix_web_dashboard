@@ -19,7 +19,8 @@ RUN useradd --create-home --uid 10001 appuser \
 # Clone dashboard
 RUN git clone --recurse-submodules https://github.com/bnnt29/solix_web_dashboard.git /app/solix_web_dashboard
 
-RUN pip install --no-cache-dir -r /app/solix_web_dashboard/Docker/requirements.txt
+RUN pip install --no-cache-dir -r /app/solix_web_dashboard/Docker/requirements.txt \
+    && chown -R appuser:appuser /app/solix_web_dashboard
 
 USER appuser
 WORKDIR /app/solix_web_dashboard
@@ -33,6 +34,6 @@ CMD ["python", "/app/solix_web_dashboard/src/api/pv_monitor.py", \
      "--web-folder", "/app/solix_web_dashboard/src/dashboard", \
      "--web-host", "0.0.0.0", \
      "--web-port", "8080", \
-     "--config", "/app/config/solix-monitor.config.json", \
+    "--config", "/app/solix_web_dashboard/config/solix-monitor.config.json", \
      "--console-detail", "compact", \
      "--console-log-level", "INFO", "--dashboard-light"]
