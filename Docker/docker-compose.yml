@@ -12,8 +12,6 @@ services:
       PYTHONUNBUFFERED: "1"
       PYTHONPATH: "/app/solix_web_dashboard/src:/app/solix_web_dashboard/src/api"
 
-    user: "${UID:-1000}:${GID:-1000}"
-
     volumes:
       # Credentials/config from host
       - ../config:/app/config:ro
