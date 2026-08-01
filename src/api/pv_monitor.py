@@ -473,6 +473,7 @@ class AnkerSolixApiMonitor:
         self.web_host: str = args.web_host
         self.web_port: int = args.web_port
         self.web_runner: web.AppRunner | None = None
+        self.web_update_clients: set[asyncio.Queue[str]] = set()
     
     
     
@@ -1088,6 +1089,13 @@ class AnkerSolixApiMonitor:
         self._last_storage_flat = current_flat
         self._last_storage_write = now
         self._last_storage_path = storage_path
+        self.notify_web_update(now.isoformat())
+
+    def notify_web_update(self, timestamp: str) -> None:
+        """Notify connected dashboards that a new snapshot is available."""
+        for queue in self.web_update_clients:
+            if queue.empty():
+                queue.put_nowait(timestamp)
         
     async def storage_loop(self) -> None:
         """Continuously store changed energy values as compact JSONL deltas."""
@@ -4304,6 +4312,36 @@ class AnkerSolixApiMonitor:
 
         app = web.Application()
 
+        async def stream_updates(request: web.Request) -> web.StreamResponse:
+            response = web.StreamResponse(
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Content-Type": "text/event-stream",
+                    "X-Accel-Buffering": "no",
+                }
+            )
+            await response.prepare(request)
+
+            queue: asyncio.Queue[str] = asyncio.Queue(maxsize=1)
+            self.web_update_clients.add(queue)
+
+            try:
+                await response.write(b": connected\n\n")
+                while True:
+                    try:
+                        timestamp = await asyncio.wait_for(queue.get(), timeout=20)
+                        message = f"event: data-available\ndata: {timestamp}\n\n"
+                    except asyncio.TimeoutError:
+                        message = ": keepalive\n\n"
+
+                    await response.write(message.encode("utf-8"))
+            except (ConnectionError, asyncio.CancelledError):
+                pass
+            finally:
+                self.web_update_clients.discard(queue)
+
+            return response
+
         async def serve_index(request: web.Request) -> web.FileResponse:
             if not index_file.is_file():
                 raise web.HTTPNotFound(
@@ -4315,6 +4353,7 @@ class AnkerSolixApiMonitor:
         # Explicitly serve index.html for the root URL.
         app.router.add_get("/", serve_index)
         app.router.add_get("/index.html", serve_index)
+        app.router.add_get("/api/updates", stream_updates)
 
         # Serve all other static files from the selected folder.
         app.router.add_static(

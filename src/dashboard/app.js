@@ -143,7 +143,22 @@ const MONTHLY_MANIFEST_PATH =
   `${String(MONTHLY_JSONL_ROOT).replace(/\/+$/, "")}/manifest.json`;
 
 const WATCH_INTERVAL_MS = 2500;
+const FETCH_TIMEOUT_MS = 10000;
 const FLOW_MIN_WATTS = 1;
+
+async function fetchWithTimeout(url, options = {}) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+
+  try {
+    return await fetch(url, {
+      ...options,
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timeout);
+  }
+}
 
 const state = {
   records: [],
@@ -1478,7 +1493,7 @@ async function fetchMonthlyManifest() {
   const url = new URL(MONTHLY_MANIFEST_PATH, window.location.href);
 
   try {
-    const response = await fetch(`${url.toString()}?_=${Date.now()}`, {
+    const response = await fetchWithTimeout(`${url.toString()}?_=${Date.now()}`, {
       cache: "no-store",
     });
 
@@ -1562,7 +1577,7 @@ async function fetchMonthlyJsonl(monthKey, { force = false, required = false } =
   const url = monthlyJsonlUrl(monthKey, isCurrentMonth || force);
 
   try {
-    const response = await fetch(url.toString(), {
+    const response = await fetchWithTimeout(url.toString(), {
       cache: "no-store",
     });
 
@@ -1610,7 +1625,7 @@ async function fetchMonthlyJsonl(monthKey, { force = false, required = false } =
 async function fetchLegacyJsonl() {
   const url = legacyJsonlUrl(true);
 
-  const response = await fetch(url.toString(), {
+  const response = await fetchWithTimeout(url.toString(), {
     cache: "no-store",
   });
 
@@ -3016,6 +3031,17 @@ loadDefaultFromExports({
   force: true,
   silent: false,
 });
+
+if ("EventSource" in window) {
+  const updates = new EventSource("./api/updates");
+
+  updates.addEventListener("data-available", () => {
+    loadDefaultFromExports({
+      force: true,
+      silent: true,
+    });
+  });
+}
 
 setInterval(() => {
   loadDefaultFromExports({
