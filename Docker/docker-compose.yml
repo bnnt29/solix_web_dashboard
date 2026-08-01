@@ -16,7 +16,7 @@ services:
 
     volumes:
       # Credentials/config from host
-      - ../config:/app/solix_web_dashboard/config:ro
+      - ../config:/app/config:ro
 
       # Persistent time-series data, served by the webserver below /exports/timeseries
       - ../data/timeseries:/app/solix_web_dashboard/src/dashboard/exports/timeseries
@@ -40,7 +40,7 @@ services:
         "--web-port",
         "8080",
         "--config",
-        "/app/solix_web_dashboard/config/solix-monitor.config.json",
+        "/app/config/solix-monitor.config.json",
         "--console-detail",
         "compact",
         "--console-log-level",
