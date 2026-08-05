@@ -27,6 +27,8 @@ services:
         "--energy-stats",
         "--interval",
         "6",
+        "--endpoint-limit",
+        "0",
         "--sample-interval",
         "3",
         "--storage-root",

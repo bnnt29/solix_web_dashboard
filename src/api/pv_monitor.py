@@ -232,10 +232,10 @@ def parse_arguments() -> argparse.Namespace:
         "--interval",
         "-i",
         type=int,
-        default=30,
+        default=6,
         choices=range(5, 601),
         metavar="[7-600]",
-        help="Refresh interval in seconds (default: 30)",
+        help="Refresh interval in seconds (default: 6)",
     )
     parser.add_argument(
         "--energy-stats",
@@ -309,10 +309,10 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         "--sample-interval",
         type=int,
-        default=10,
+        default=6,
         choices=range(3, 3601),
         metavar="[3-3600]",
-        help="Storage sample interval in seconds (default: 10)",
+        help="Storage sample interval in seconds (default: 6)",
     )
     parser.add_argument(
         "--config",
@@ -995,7 +995,7 @@ class AnkerSolixApiMonitor:
         return payload
 
     async def write_storage_snapshot(self) -> None:
-        """Append only changed compact energy values as one JSONL record.
+        """Append one compact energy sample as a JSONL record.
 
         Data is stored in monthly files:
 
@@ -1105,7 +1105,7 @@ class AnkerSolixApiMonitor:
                 queue.put_nowait(timestamp)
         
     async def storage_loop(self) -> None:
-        """Continuously store changed energy values as compact JSONL deltas."""
+        """Continuously store energy samples as compact JSONL deltas."""
         CONSOLE.info(
             "Storage enabled: checking every %s second(s), writing monthly JSONL files below %s",
             self.sample_interval,
